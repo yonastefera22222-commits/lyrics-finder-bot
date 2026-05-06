@@ -16,11 +16,9 @@ def home():
     return "Bot is alive and running."
 
 def run_flask():
-    # Render requires the app to run on 0.0.0.0
     app.run(host='0.0.0.0', port=8080)
 
 # --- CONFIGURATION ---
-# IMPORTANT: Ensure your Render Environment Variable is named TELEGRAM_BOT_TOKEN
 API_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 ADMIN_ID = int(os.environ.get('ADMIN_ID', 0))
 bot = telebot.TeleBot(API_TOKEN)
@@ -33,76 +31,39 @@ search_counts = {}
 
 RANDOM_QUERIES = [
     "bohemian rhapsody", "blinding lights", "hotel california", "shape of you",
-    "rolling in the deep", "smells like teen spirit", "thriller", "lose yourself",
-    "someone like you", "stay with me", "bad guy", "levitating", "drivers license",
-    "montero", "watermelon sugar", "good 4 u", "shivers", "easy on me",
-    "as it was", "unholy", "flowers", "cruel summer", "vampire", "golden hour"
+    "rolling in the deep", "smells like teen spirit", "thriller", "lose yourself"
 ]
 
 TRENDING_POOL = [
-    "espresso sabrina carpenter", "please please please sabrina carpenter",
-    "apt rose bruno mars", "die with a smile lady gaga bruno mars",
-    "birds of a feather billie eilish", "lunch billie eilish",
-    "too sweet hozier", "fortnight taylor swift",
-    "not like us kendrick lamar", "million dollar baby tommy richman",
-    "beautiful things benson boone", "we can't be friends ariana grande",
-    "good luck luck dua lipa", "illusion dua lipa",
-    "lose control teddy swims", "i had some help morgan wallen",
-    "texas hold em beyonce", "salvation chris brown",
-    "euphoria kendrick lamar", "squabble up kendrick lamar",
-    "timeless the weeknd playboi carti", "sinner pray for me the weeknd",
-    "luther kendrick lamar sza", "tv off kendrick lamar"
+    "espresso sabrina carpenter", "apt rose bruno mars", "birds of a feather billie eilish"
 ]
 
-BTN_HELP      = "❓ Help"
-BTN_STATS     = "📊 Stats"
-BTN_TRENDING  = "🔥 Trending"
-BTN_TOP       = "🏆 Top"
-BTN_RANDOM    = "🎲 Random"
-BTN_ADD_GROUP = "➕ Add to Group"
-BTN_LISTUSERS = "👥 List Users"
-BTN_BROADCAST = "📢 Broadcast"
-MENU_BUTTONS  = {BTN_HELP, BTN_STATS, BTN_TRENDING, BTN_TOP, BTN_RANDOM, BTN_ADD_GROUP, BTN_LISTUSERS, BTN_BROADCAST}
+BTN_HELP, BTN_STATS, BTN_TRENDING = "❓ Help", "📊 Stats", "🔥 Trending"
+BTN_TOP, BTN_RANDOM, BTN_ADD_GROUP = "🏆 Top", "🎲 Random", "➕ Add to Group"
+MENU_BUTTONS = {BTN_HELP, BTN_STATS, BTN_TRENDING, BTN_TOP, BTN_RANDOM, BTN_ADD_GROUP}
 
-# --- DATABASE UTILITIES ---
+# --- UTILITIES ---
 def register_user(user_id):
     if not is_user_authorized(user_id):
-        with open(USER_DB, "a") as f:
-            f.write(f"{user_id}\n")
+        with open(USER_DB, "a") as f: f.write(f"{user_id}\n")
 
 def is_user_authorized(user_id):
-    if not os.path.exists(USER_DB):
-        return True # Fallback so the bot doesn't lock everyone out if file is missing
-    with open(USER_DB, "r") as f:
-        authorized_users = f.read().splitlines()
-    return str(user_id) in authorized_users
+    if not os.path.exists(USER_DB): return True
+    with open(USER_DB, "r") as f: return str(user_id) in f.read().splitlines()
 
-# --- HELPERS ---
 def format_duration(seconds):
-    if not seconds: return "N/A"
-    return f"{seconds // 60}m {seconds % 60}s"
-
-def get_requester(message):
-    if message.chat.type in ['group', 'supergroup']:
-        user = message.from_user
-        name = user.first_name + (f" {user.last_name}" if user.last_name else "")
-        return f"👤 Requested by: *{name}*\n"
-    return ""
+    return f"{seconds // 60}m {seconds % 60}s" if seconds else "N/A"
 
 def get_menu_markup(user_id=None):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row(types.KeyboardButton(BTN_HELP), types.KeyboardButton(BTN_STATS))
-    markup.row(types.KeyboardButton(BTN_TRENDING), types.KeyboardButton(BTN_TOP))
-    markup.row(types.KeyboardButton(BTN_RANDOM))
-    markup.row(types.KeyboardButton(BTN_ADD_GROUP))
-    if user_id and user_id == ADMIN_ID:
-        markup.row(types.KeyboardButton(BTN_LISTUSERS), types.KeyboardButton(BTN_BROADCAST))
+    markup.row(BTN_HELP, BTN_STATS)
+    markup.row(BTN_TRENDING, BTN_TOP)
+    markup.row(BTN_RANDOM, BTN_ADD_GROUP)
     return markup
 
+# --- LOGIC ---
 def do_search(message, query):
     stats['searches'] += 1
-    requester = get_requester(message)
-    search_counts[query.lower()] = search_counts.get(query.lower(), 0) + 1
     status = bot.reply_to(message, f"🔍 Searching for *{query}*...", parse_mode='Markdown')
     try:
         res = requests.get(f"https://lrclib.net/api/search?q={query}")
@@ -112,131 +73,56 @@ def do_search(message, query):
             return
         markup = types.InlineKeyboardMarkup()
         for track in results[:6]:
-            btn_text = f"{track['artistName']} — {track['trackName']}"
-            markup.add(types.InlineKeyboardButton(text=btn_text, callback_data=f"sel_{track['id']}"))
-        prompt = f"{requester}Select a version:" if requester else f"Results for *{query}*:"
-        bot.edit_message_text(prompt, message.chat.id, status.message_id, reply_markup=markup, parse_mode='Markdown')
+            markup.add(types.InlineKeyboardButton(text=f"{track['artistName']} - {track['trackName']}", callback_data=f"sel_{track['id']}"))
+        bot.edit_message_text(f"Results for *{query}*:", message.chat.id, status.message_id, reply_markup=markup, parse_mode='Markdown')
     except:
         bot.edit_message_text("Connection error.", message.chat.id, status.message_id)
 
-# --- COMMAND HANDLERS ---
+# --- HANDLERS ---
 @bot.message_handler(commands=['start'])
 def start(message):
     register_user(message.from_user.id)
-    bot.send_message(message.chat.id, "✅ *Registration complete.*", reply_markup=get_menu_markup(message.from_user.id), parse_mode='Markdown')
+    bot.send_message(message.chat.id, "✅ *Registered.* Type a song name!", reply_markup=get_menu_markup(message.from_user.id), parse_mode='Markdown')
 
-@bot.message_handler(commands=['stats'])
-def send_stats(message):
-    uptime = datetime.now() - START_TIME
-    text = f"📊 *Bot Statistics*\n\n🔍 Searches: {stats['searches']}\n🎵 Lyrics: {stats['lyrics_delivered']}\n🎲 Random: {stats['random_used']}"
-    bot.reply_to(message, text, parse_mode='Markdown')
+@bot.message_handler(func=lambda m: m.text in MENU_BUTTONS)
+def menu_handler(message):
+    if message.text == BTN_RANDOM: random_song(message)
+    elif message.text == BTN_STATS:
+        bot.reply_to(message, f"📊 Searches: {stats['searches']}\n🎵 Lyrics: {stats['lyrics_delivered']}")
 
-@bot.message_handler(commands=['random'])
 def random_song(message):
-    stats['random_used'] += 1
     query = random.choice(RANDOM_QUERIES)
-    status = bot.reply_to(message, f"🎲 Fetching: *{query}*...", parse_mode='Markdown')
-    try:
-        res = requests.get(f"https://lrclib.net/api/search?q={query}")
-        results = res.json()
-        pick = random.choice(results[:6])
-        track_id = pick['id']
-        res2 = requests.get(f"https://lrclib.net/api/get/{track_id}")
-        t = res2.json()
-        info = f"🎲 *Random Pick*\n\n🎵 {t['artistName']} — {t['trackName']}"
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("Synced Text", callback_data=f"st_{track_id}"), 
-                   types.InlineKeyboardButton("Plain Text", callback_data=f"pt_{track_id}"))
-        markup.add(types.InlineKeyboardButton("🎲 Another Random", callback_data="random"))
-        bot.edit_message_text(info, message.chat.id, status.message_id, reply_markup=markup, parse_mode='Markdown')
-    except:
-        bot.edit_message_text("Error fetching random song.", message.chat.id, status.message_id)
-
-# --- CALLBACK HANDLERS (THE FIXES) ---
-
-@bot.callback_query_handler(func=lambda call: call.data == "random")
-def random_callback(call):
-    bot.answer_callback_query(call.id) # FIX: Stops the spinner
-    random_song(call.message)
+    do_search(message, query)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('sel_'))
 def show_options(call):
-    bot.answer_callback_query(call.id) # FIX: Stops the spinner
+    bot.answer_callback_query(call.id)
     track_id = call.data.split('_')[1]
-    res = requests.get(f"https://lrclib.net/api/get/{track_id}")
-    t = res.json()
-    info = f"🎵 {t['artistName']} — {t['trackName']}\n💿 Album: {t.get('albumName', 'N/A')}"
+    res = requests.get(f"https://lrclib.net/api/get/{track_id}").json()
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("Synced Text", callback_data=f"st_{track_id}"),
-               types.InlineKeyboardButton("Plain Text", callback_data=f"pt_{track_id}"))
-    bot.edit_message_text(info, call.message.chat.id, call.message.message_id, reply_markup=markup)
+    markup.add(types.InlineKeyboardButton("Get Lyrics", callback_data=f"pt_{track_id}"))
+    bot.edit_message_text(f"🎵 {res['artistName']} - {res['trackName']}", call.message.chat.id, call.message.message_id, reply_markup=markup)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith(('sf_', 'st_', 'pf_', 'pt_')))
+@bot.callback_query_handler(func=lambda call: call.data.startswith('pt_'))
 def deliver_lyrics(call):
-    bot.answer_callback_query(call.id) # FIX: Stops the spinner
-    stats['lyrics_delivered'] += 1
-    prefix, track_id = call.data.split('_')
-    res = requests.get(f"https://lrclib.net/api/get/{track_id}")
-    t = res.json()
-    lyrics = t.get('syncedLyrics') if 's' in prefix else t.get('plainLyrics')
-    if lyrics:
-        bot.send_message(call.message.chat.id, lyrics[:4000])
-    else:
-        bot.send_message(call.message.chat.id, "Lyrics not available for this version.")
+    bot.answer_callback_query(call.id)
+    track_id = call.data.split('_')[1]
+    res = requests.get(f"https://lrclib.net/api/get/{track_id}").json()
+    lyrics = res.get('plainLyrics') or "No lyrics found."
+    bot.send_message(call.message.chat.id, lyrics[:4000])
 
-# --- DM TEXT HANDLER ---
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.text not in MENU_BUTTONS)
+@bot.message_handler(func=lambda m: m.chat.type == 'private')
 def dm_search(message):
     do_search(message, message.text)
 
-# --- STARTUP LOGIC (FIX FOR STATUS 1) ---
+# --- STARTUP ---
 if __name__ == "__main__":
-    # Start the web server thread
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-    
-    print("Bot is successfully starting...")
-    # Start the bot
+    t = Thread(target=run_flask)
+    t.daemon = True
+    t.start()
+    print("Bot is starting...")
     bot.infinity_polling()
-    "as it was", "unholy", "flowers", "cruel summer", "vampire", "golden hour"
-]
-
-TRENDING_POOL = [
-    "espresso sabrina carpenter", "please please please sabrina carpenter",
-    "apt rose bruno mars", "die with a smile lady gaga bruno mars",
-    "birds of a feather billie eilish", "lunch billie eilish",
-    "too sweet hozier", "fortnight taylor swift",
-    "not like us kendrick lamar", "million dollar baby tommy richman",
-    "beautiful things benson boone", "we can't be friends ariana grande",
-    "good luck luck dua lipa", "illusion dua lipa",
-    "lose control teddy swims", "i had some help morgan wallen",
-    "texas hold em beyonce", "salvation chris brown",
-    "euphoria kendrick lamar", "squabble up kendrick lamar",
-    "timeless the weeknd playboi carti", "sinner pray for me the weeknd",
-    "luther kendrick lamar sza", "tv off kendrick lamar"
-]
-
-# --- MENU BUTTON LABELS ---
-BTN_HELP      = "❓ Help"
-BTN_STATS     = "📊 Stats"
-BTN_TRENDING  = "🔥 Trending"
-BTN_TOP       = "🏆 Top"
-BTN_RANDOM    = "🎲 Random"
-BTN_ADD_GROUP = "➕ Add to Group"
-MENU_BUTTONS  = {BTN_HELP, BTN_STATS, BTN_TRENDING, BTN_TOP, BTN_RANDOM, BTN_ADD_GROUP,
-                 "👥 List Users", "📢 Broadcast"}
-
-# --- DATABASE UTILITIES ---
-def register_user(user_id):
-    if not is_user_authorized(user_id):
-        with open(USER_DB, "a") as f:
-            f.write(f"{user_id}\n")
-
-def is_user_authorized(user_id):
-    if not os.path.exists(USER_DB):
-        return False
-    with open(USER_DB, "r") as f:
+r") as f:
         authorized_users = f.read().splitlines()
     return str(user_id) in authorized_users
 
