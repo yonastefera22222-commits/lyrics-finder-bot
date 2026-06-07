@@ -12,6 +12,8 @@ from pathlib import Path
 import tempfile
 import json
 from metadata_handler import read_id3v2_metadata, embed_lyrics_in_file
+import signal
+import sys
 
 # --- OWNER ID (set your Telegram user ID here) ---
 OWNER_ID = 951232574  # <<<<<<------- OWNER ID SET HERE
@@ -25,9 +27,10 @@ TEMP_DIR = tempfile.gettempdir()
 
 # --- MEMORY OPTIMIZATION: Reduce cache sizes ---
 MAX_CACHE_SIZE = 20
-CLEANUP_INTERVAL = 1800  # 30 minutes
+CLEANUP_INTERVAL = 3600  # 60 minutes (increased from 30)
+FILE_EXPIRY_HOURS = 4  # 4 hours (increased from 0.5)
 
-def cleanup_old_files(max_age_hours=0.5):
+def cleanup_old_files(max_age_hours=FILE_EXPIRY_HOURS):
     """Clean up old temporary files to save storage"""
     try:
         now = datetime.now().timestamp()
@@ -36,8 +39,9 @@ def cleanup_old_files(max_age_hours=0.5):
             if file.is_file() and (now - file.stat().st_mtime) > (max_age_hours * 3600):
                 try:
                     file.unlink()
-                except:
-                    pass
+                    print(f"[DEBUG] Deleted expired file: {file.name}")
+                except Exception as e:
+                    print(f"[DEBUG] Could not delete {file.name}: {e}")
         gc.collect()
     except Exception as e:
         print(f"Cleanup error: {e}")
@@ -86,7 +90,14 @@ def home():
     return "Bot is alive and running."
 
 def start_bot():
-    bot.infinity_polling()
+    """Start bot with skip_pending to prevent conflict with other instances"""
+    try:
+        bot.infinity_polling(skip_pending=True, timeout=30)
+    except KeyboardInterrupt:
+        print("[INFO] Bot interrupted")
+    except Exception as e:
+        print(f"[ERROR] Bot error: {e}")
+        sys.exit(1)
 
 # --- CONFIGURATION ---
 API_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
@@ -847,7 +858,7 @@ def do_infuse_callback(call):
         file_path = os.path.join(TEMP_DIR, file_name)
         
         if not os.path.exists(file_path):
-            bot.edit_message_text("❌ File expired.", call.message.chat.id, msg.message_id)
+            bot.edit_message_text("❌ File expired. Please send the music file again.", call.message.chat.id, msg.message_id)
             return
         
         bot.edit_message_text("⏳ Embedding lyrics...", call.message.chat.id, msg.message_id)
@@ -871,12 +882,8 @@ def do_infuse_callback(call):
         except:
             pass
         
-        try:
-            os.remove(file_path)
-        except:
-            pass
-        
         stats['lyrics_delivered'] += 1
+        print(f"[DEBUG] File will expire in {FILE_EXPIRY_HOURS} hours")
         gc.collect()
         
     except Exception as e:
@@ -1053,10 +1060,24 @@ cleanup_t = Thread(target=cleanup_thread, daemon=True)
 cleanup_t.daemon = True
 cleanup_t.start()
 
-# --- START BOT ---
-bot_thread = Thread(target=start_bot, daemon=True)
-bot_thread.daemon = True
-bot_thread.start()
+# --- GRACEFUL SHUTDOWN ---
+def signal_handler(sig, frame):
+    print("[INFO] Shutting down gracefully...")
+    sys.exit(0)
 
-port = int(os.environ.get('PORT', 8080))
-app.run(host='0.0.0.0', port=port, threaded=True)
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+# --- START BOT ---
+if __name__ == "__main__":
+    print("[INFO] Starting Lyrics Finder Bot...")
+    bot_thread = Thread(target=start_bot, daemon=True)
+    bot_thread.daemon = True
+    bot_thread.start()
+    
+    port = int(os.environ.get('PORT', 8080))
+    print(f"[INFO] Flask running on port {port}")
+    try:
+        app.run(host='0.0.0.0', port=port, threaded=True, debug=False)
+    except KeyboardInterrupt:
+        print("[INFO] Bot stopped")
