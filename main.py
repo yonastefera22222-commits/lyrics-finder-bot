@@ -7,11 +7,11 @@ import random
 from flask import Flask
 from threading import Thread
 from datetime import datetime
-import eyed3
 import gc
 from pathlib import Path
 import tempfile
 import json
+from metadata_handler import read_id3v2_metadata, embed_lyrics_in_file
 
 # --- OWNER ID (set your Telegram user ID here) ---
 OWNER_ID = 951232574  # <<<<<<------- OWNER ID SET HERE
@@ -163,7 +163,7 @@ TRENDING_POOL = [
 ]
 
 def escape_markdown_v2(text):
-    chars = r"\_*[]()~`>#+-=|{}.!<>"
+    chars = r"_*[]()~`>#+-=|{}.!<>"
     return "".join("\\" + c if c in chars else c for c in text)
 
 BTN_HELP      = "❓ Help"
@@ -216,41 +216,22 @@ def get_menu_markup(user_id=None):
     return markup
 
 def extract_music_metadata(file_path):
-    """Extract metadata from music file using eyed3 - optimized"""
+    """Extract metadata from music file"""
     try:
-        audio = eyed3.load(file_path)
-        if audio is None:
-            print(f"[DEBUG] eyed3.load returned None for {file_path}")
+        metadata = read_id3v2_metadata(file_path)
+        
+        if not metadata:
+            print(f"[DEBUG] No metadata found for {file_path}")
             return None
         
-        if audio.tag is None:
-            print(f"[DEBUG] audio.tag is None for {file_path}")
-            return None
+        print(f"[DEBUG] Metadata extracted: Artist={metadata['artist']}, Title={metadata['title']}")
+        return metadata
         
-        artist = str(audio.tag.artist or "Unknown Artist").strip()
-        title = str(audio.tag.title or "Unknown Track").strip()
-        album = str(audio.tag.album or "Unknown Album").strip()
-        duration = audio.info.time_secs if audio.info else None
-        
-        print(f"[DEBUG] Metadata extracted: Artist={artist}, Title={title}, Album={album}, Duration={duration}")
-        
-        return {
-            "artist": artist[:100],
-            "title": title[:100],
-            "album": album[:100],
-            "duration": duration
-        }
     except Exception as e:
         print(f"[ERROR] Metadata error: {e}")
         import traceback
         traceback.print_exc()
         return None
-    finally:
-        try:
-            del audio
-        except:
-            pass
-        gc.collect()
 
 def search_lyrics_by_metadata(artist, title, duration=None):
     """Search for lyrics efficiently - IMPROVED"""
@@ -338,43 +319,6 @@ def get_lyrics_by_track_id(track_id):
         import traceback
         traceback.print_exc()
         return None
-
-def embed_lyrics_in_file(file_path, lyrics_text, lyrics_type="plain"):
-    """Embed lyrics efficiently"""
-    try:
-        # Limit lyrics to 40KB
-        if len(lyrics_text.encode('utf-8')) > 40 * 1024:
-            lyrics_text = lyrics_text[:10000]
-        
-        audio = eyed3.load(file_path)
-        if audio is None:
-            return False
-        
-        if audio.tag is None:
-            audio.initTag()
-        
-        if lyrics_type == "synced":
-            from eyed3.id3.frames import UnsynchronizedTextFrame
-            audio.tag.unsyched_lyrics = UnsynchronizedTextFrame(
-                text=lyrics_text[:5000],
-                lang="eng"
-            )
-        else:
-            audio.tag.comments.set(lyrics_text[:5000], lang="eng")
-        
-        audio.tag.save(version=(3, 0))
-        return True
-    except Exception as e:
-        print(f"[ERROR] Embed error: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-    finally:
-        try:
-            del audio
-        except:
-            pass
-        gc.collect()
 
 def do_search(message, query):
     save_chat(message.chat)
@@ -805,7 +749,7 @@ def handle_music_file(message):
         markup = types.InlineKeyboardMarkup()
         markup.row(
             types.InlineKeyboardButton("📄 View", callback_data=f"view_lyrics_{track['id']}"),
-            types.InlineKeyboardButton("🎵 Infuse", callback_data=f"infuse_music_{track['id']}_{file_name}")
+            types.InlineKeyboardButton("🎵 Lyricize", callback_data=f"infuse_music_{track['id']}_{file_name}")
         )
         
         bot.send_message(message.chat.id, info_text, reply_markup=markup, parse_mode='Markdown')
@@ -875,7 +819,7 @@ def infuse_music_callback(call):
     if has_plain:
         markup.add(types.InlineKeyboardButton("✨ Plain", callback_data=f"do_infuse_{track_id}_{file_name}_plain"))
     
-    bot.send_message(call.message.chat.id, "Choose format:", reply_markup=markup)
+    bot.send_message(call.message.chat.id, "Choose lyrics type to embed:", reply_markup=markup)
     gc.collect()
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('do_infuse_'))
@@ -906,21 +850,21 @@ def do_infuse_callback(call):
             bot.edit_message_text("❌ File expired.", call.message.chat.id, msg.message_id)
             return
         
-        bot.edit_message_text("⏳ Infusing...", call.message.chat.id, msg.message_id)
+        bot.edit_message_text("⏳ Embedding lyrics...", call.message.chat.id, msg.message_id)
         
         success = embed_lyrics_in_file(file_path, lyrics_content, lyrics_type)
         
         if not success:
-            bot.edit_message_text("❌ Failed.", call.message.chat.id, msg.message_id)
+            bot.edit_message_text("❌ Failed to embed lyrics.", call.message.chat.id, msg.message_id)
             return
         
-        bot.edit_message_text("⏳ Sending...", call.message.chat.id, msg.message_id)
+        bot.edit_message_text("⏳ Sending lyricized file...", call.message.chat.id, msg.message_id)
         
         artist = lyrics_data.get('artistName', 'Unknown')[:20]
         title = lyrics_data.get('trackName', 'Unknown')[:20]
         
         with open(file_path, 'rb') as f:
-            bot.send_document(call.message.chat.id, f, caption=f"🎵 {artist} - {title}\n✨ Lyricized!")
+            bot.send_document(call.message.chat.id, f, caption=f"🎵 {artist} - {title}\n✨ Lyricized ({lyrics_type})!")
         
         try:
             bot.delete_message(call.message.chat.id, msg.message_id)
@@ -940,7 +884,7 @@ def do_infuse_callback(call):
         import traceback
         traceback.print_exc()
         try:
-            bot.edit_message_text("❌ Error.", call.message.chat.id, msg.message_id)
+            bot.edit_message_text("❌ Error embedding lyrics.", call.message.chat.id, msg.message_id)
         except:
             pass
         gc.collect()
@@ -1025,7 +969,9 @@ def deliver_lyrics(call):
         if data and len(data) <= 3500:
             bot.send_message(call.message.chat.id, f"`{data[:3500]}`", parse_mode='Markdown')
         elif data:
-            bot.send_message(call.message.chat.id, "❌ Too long for text. Use file option.")
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("Send as file", callback_data=f"sf_{track_id}"))
+            bot.send_message(call.message.chat.id, "⚠️ Too long for text. Use file option?", reply_markup=markup)
         else:
             bot.answer_callback_query(call.id, "Not available.")
     elif cmd == "pf":
@@ -1042,7 +988,9 @@ def deliver_lyrics(call):
         if data and len(data) <= 4000:
             bot.send_message(call.message.chat.id, data[:4000])
         elif data:
-            bot.send_message(call.message.chat.id, "❌ Too long for text. Use file option.")
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("Send as file", callback_data=f"pf_{track_id}"))
+            bot.send_message(call.message.chat.id, "⚠️ Too long for text. Use file option?", reply_markup=markup)
         else:
             bot.answer_callback_query(call.id, "Not available.")
     
