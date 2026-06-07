@@ -564,6 +564,536 @@ def broadcast(message):
             sent += 1
         except:
             failed += 1
+    bot.reply_to(message, f"✅ Sent        temp_path = Path(TEMP_DIR)
+        for file in temp_path.glob("*lyrics*"):
+            if file.is_file() and (now - file.stat().st_mtime) > (max_age_hours * 3600):
+                try:
+                    file.unlink()
+                    print(f"[DEBUG] Deleted expired file: {file.name}")
+                except Exception as e:
+                    print(f"[DEBUG] Could not delete {file.name}: {e}")
+        gc.collect()
+    except Exception as e:
+        print(f"Cleanup error: {e}")
+
+def save_chat(chat):
+    if chat.type in ("group", "supergroup"):
+        db_file = GROUP_CHAT_DB
+    elif chat.type == "private":
+        db_file = PRIVATE_CHAT_DB
+    else:
+        return
+    chat_id = str(chat.id)
+    if not os.path.exists(db_file):
+        with open(db_file, "w") as f:
+            f.write(chat_id + "\n")
+        return
+    try:
+        with open(db_file, "r+") as f:
+            ids = set(line.strip() for line in f)
+            if chat_id not in ids:
+                f.write(chat_id + "\n")
+    except:
+        pass
+
+def get_all_target_chats():
+    ids = set()
+    if os.path.exists(PRIVATE_CHAT_DB):
+        try:
+            with open(PRIVATE_CHAT_DB) as f:
+                ids.update(int(line.strip()) for line in f if line.strip())
+        except:
+            pass
+    if os.path.exists(GROUP_CHAT_DB):
+        try:
+            with open(GROUP_CHAT_DB) as f:
+                ids.update(int(line.strip()) for line in f if line.strip())
+        except:
+            pass
+    return list(ids)
+
+# --- FLASK KEEP-ALIVE ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive and running."
+
+def start_bot():
+    """Start bot with skip_pending to prevent conflict with other instances"""
+    try:
+        bot.infinity_polling(skip_pending=True, timeout=30)
+    except KeyboardInterrupt:
+        print("[INFO] Bot interrupted")
+    except Exception as e:
+        print(f"[ERROR] Bot error: {e}")
+        sys.exit(1)
+
+# --- CONFIGURATION ---
+API_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+if not API_TOKEN:
+    raise ValueError("Missing TELEGRAM_BOT_TOKEN environment variable")
+
+bot = telebot.TeleBot(API_TOKEN, threaded=True, skip_pending=True)
+
+# --- INIT ADMIN DB AND MIGRATE TEXT ADMINS ---
+import admin_db
+admin_db.setup_db()
+if os.path.exists("authorized_users.txt"):
+    try:
+        with open("authorized_users.txt") as f:
+            for uid in f.read().splitlines():
+                if uid.strip().isdigit():
+                    admin_db.add_admin(uid.strip())
+    except:
+        pass
+
+# --- STATS (Memory efficient) ---
+START_TIME = datetime.now()
+stats = {"searches": 0, "lyrics_delivered": 0, "random_used": 0}
+search_counts = {}
+last_cleanup = datetime.now()
+
+# --- LIGHTWEIGHT CACHE ---
+class LightweightCache:
+    def __init__(self, max_size=MAX_CACHE_SIZE):
+        self.cache = {}
+        self.max_size = max_size
+        self.access_order = []
+    
+    def get(self, key):
+        if key in self.cache:
+            self.access_order.remove(key)
+            self.access_order.append(key)
+            return self.cache[key]
+        return None
+    
+    def set(self, key, value):
+        if len(self.cache) >= self.max_size:
+            oldest = self.access_order.pop(0)
+            del self.cache[oldest]
+            gc.collect()
+        self.cache[key] = value
+        if key in self.access_order:
+            self.access_order.remove(key)
+        self.access_order.append(key)
+
+lyrics_cache = LightweightCache(MAX_CACHE_SIZE)
+
+RANDOM_QUERIES = [
+    "bohemian rhapsody", "blinding lights", "hotel california", "shape of you",
+    "rolling in the deep", "smells like teen spirit", "thriller", "lose yourself",
+    "someone like you", "stay with me", "bad guy", "levitating", "drivers license",
+    "montero", "watermelon sugar", "good 4 u", "shivers", "easy on me",
+    "as it was", "unholy", "flowers", "cruel summer", "vampire", "golden hour"
+]
+
+TRENDING_POOL = [
+    "espresso sabrina carpenter", "please please please sabrina carpenter",
+    "apt rose bruno mars", "die with a smile lady gaga bruno mars",
+    "birds of a feather billie eilish", "lunch billie eilish",
+    "too sweet hozier", "fortnight taylor swift",
+    "not like us kendrick lamar", "million dollar baby tommy richman",
+    "beautiful things benson boone", "we can't be friends ariana grande",
+    "good luck luck dua lipa", "illusion dua lipa",
+    "lose control teddy swims", "i had some help morgan wallen",
+    "texas hold em beyonce", "salvation chris brown",
+    "euphoria kendrick lamar", "squabble up kendrick lamar",
+    "timeless the weeknd playboi carti", "sinner pray for me the weeknd",
+    "luther kendrick lamar sza", "tv off kendrick lamar"
+]
+
+def escape_markdown_v2(text):
+    chars = r"_*[]()~`>#+-=|{}.!<>"
+    return "".join("\\" + c if c in chars else c for c in text)
+
+BTN_HELP      = "❓ Help"
+BTN_STATS     = "📊 Stats"
+BTN_TRENDING  = "🔥 Trending"
+BTN_TOP       = "🏆 Top"
+BTN_RANDOM    = "🎲 Random"
+BTN_ADD_GROUP = "➕ Add to Group"
+MENU_BUTTONS  = {BTN_HELP, BTN_STATS, BTN_TRENDING, BTN_TOP, BTN_RANDOM, BTN_ADD_GROUP,
+                 "👥 List Admins", "📢 Broadcast", "➕ Add Admin", "➖ Remove Admin"}
+
+BTN_LISTADMINS = "👥 List Admins"
+BTN_BROADCAST = "📢 Broadcast"
+BTN_ADDADMIN = "➕ Add Admin"
+BTN_REMOVEADMIN = "➖ Remove Admin"
+
+def format_duration(seconds):
+    if not seconds:
+        return "N/A"
+    return f"{seconds // 60}m {seconds % 60}s"
+
+def get_requester(message):
+    if message.chat.type in ['group', 'supergroup']:
+        user = message.from_user
+        name = user.first_name
+        if user.last_name:
+            name += f" {user.last_name}"
+        return f"👤 Requested by: *{name}*\n"
+    return ""
+
+def get_menu_markup(user_id=None):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
+    markup.row(types.KeyboardButton(BTN_HELP), types.KeyboardButton(BTN_STATS))
+    markup.row(types.KeyboardButton(BTN_TRENDING), types.KeyboardButton(BTN_TOP))
+    markup.row(types.KeyboardButton(BTN_RANDOM))
+    markup.row(types.KeyboardButton(BTN_ADD_GROUP))
+    if user_id and admin_db.is_admin(user_id):
+        if user_id == OWNER_ID:
+            markup.row(
+                types.KeyboardButton(BTN_LISTADMINS),
+                types.KeyboardButton(BTN_BROADCAST),
+                types.KeyboardButton(BTN_ADDADMIN),
+                types.KeyboardButton(BTN_REMOVEADMIN)
+            )
+        else:
+            markup.row(
+                types.KeyboardButton(BTN_LISTADMINS),
+                types.KeyboardButton(BTN_BROADCAST)
+            )
+    return markup
+
+def extract_music_metadata(file_path):
+    """Extract metadata from music file"""
+    try:
+        metadata = read_id3v2_metadata(file_path)
+        
+        if not metadata:
+            print(f"[DEBUG] No metadata found for {file_path}")
+            return None
+        
+        print(f"[DEBUG] Metadata extracted: Artist={metadata['artist']}, Title={metadata['title']}")
+        return metadata
+        
+    except Exception as e:
+        print(f"[ERROR] Metadata error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def search_lyrics_by_metadata(artist, title, duration=None):
+    """Search for lyrics efficiently - IMPROVED"""
+    try:
+        # Clean up artist and title
+        artist = artist.strip()
+        title = title.strip()
+        
+        # Try exact search first
+        query = f"{artist} {title}"
+        print(f"[DEBUG] Searching for lyrics with query: {query}")
+        
+        res = requests.get(
+            f"https://lrclib.net/api/search?q={query[:100]}",
+            timeout=10
+        )
+        results = res.json()
+        
+        print(f"[DEBUG] API returned {len(results)} results")
+        
+        if not results:
+            print("[DEBUG] No results found, trying alternate search")
+            # Try just the title
+            res = requests.get(
+                f"https://lrclib.net/api/search?q={title[:100]}",
+                timeout=10
+            )
+            results = res.json()
+            print(f"[DEBUG] Alternate search returned {len(results)} results")
+        
+        if not results:
+            return None
+        
+        artist_lower = artist.lower().strip()
+        title_lower = title.lower().strip()
+        
+        # First pass: exact match
+        for track in results:
+            track_artist = track.get('artistName', '').lower().strip()
+            track_title = track.get('trackName', '').lower().strip()
+            
+            if artist_lower == track_artist and title_lower == track_title:
+                print(f"[DEBUG] Found exact match: {track}")
+                return track
+        
+        # Second pass: fuzzy match
+        for track in results:
+            track_artist = track.get('artistName', '').lower().strip()
+            track_title = track.get('trackName', '').lower().strip()
+            
+            if (artist_lower in track_artist or track_artist in artist_lower) and \
+               (title_lower in track_title or track_title in title_lower):
+                print(f"[DEBUG] Found fuzzy match: {track}")
+                return track
+        
+        # Fallback to first result
+        print(f"[DEBUG] Using first result as fallback: {results[0]}")
+        return results[0]
+        
+    except Exception as e:
+        print(f"[ERROR] Search error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def get_lyrics_by_track_id(track_id):
+    """Fetch lyrics with caching"""
+    cached = lyrics_cache.get(track_id)
+    if cached:
+        print(f"[DEBUG] Using cached lyrics for track {track_id}")
+        return cached
+    
+    try:
+        print(f"[DEBUG] Fetching lyrics for track {track_id}")
+        res = requests.get(
+            f"https://lrclib.net/api/get/{track_id}",
+            timeout=10
+        )
+        data = res.json()
+        lyrics_cache.set(track_id, data)
+        print(f"[DEBUG] Successfully fetched lyrics for track {track_id}")
+        return data
+    except Exception as e:
+        print(f"[ERROR] Fetch error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def do_search(message, query):
+    save_chat(message.chat)
+    stats['searches'] += 1
+    requester = get_requester(message)
+    query_key = query.lower()[:50]
+    search_counts[query_key] = search_counts.get(query_key, 0) + 1
+    
+    status = bot.reply_to(message, f"🔍 Searching for *{query[:40]}*...", parse_mode='Markdown')
+    try:
+        res = requests.get(f"https://lrclib.net/api/search?q={query[:50]}", timeout=10)
+        results = res.json()[:10]
+        
+        query_low = query.strip().lower()
+        filtered = [
+            track for track in results
+            if query_low in track.get('trackName', '').lower() or 
+               query_low in track.get('artistName', '').lower()
+        ][:6]
+        
+        display_tracks = filtered if filtered else results[:6]
+
+        if not display_tracks:
+            bot.edit_message_text("No results found.", message.chat.id, status.message_id)
+            return
+        
+        markup = types.InlineKeyboardMarkup()
+        for track in display_tracks:
+            artist = track.get('artistName', 'Unknown')[:25]
+            title = track.get('trackName', 'Unknown')[:25]
+            btn_text = f"{artist} — {title}"
+            markup.add(types.InlineKeyboardButton(text=btn_text, callback_data=f"sel_{track.get('id')}"))
+        
+        prompt = "Select a version:" if requester else "Results:"
+        bot.edit_message_text(prompt, message.chat.id, status.message_id,
+                              reply_markup=markup, parse_mode='Markdown')
+    except Exception as e:
+        print(f"[ERROR] Search exception: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            bot.edit_message_text("Connection error.", message.chat.id, status.message_id)
+        except:
+            pass
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    save_chat(message.chat)
+    bot.send_message(
+        message.chat.id,
+        "✅ *Welcome!*\n\nSearch lyrics or send music files!\n\n"
+        "_In DM: type song name_\n"
+        "_In groups: /lyrics songname_",
+        reply_markup=get_menu_markup(message.from_user.id),
+        parse_mode='Markdown'
+    )
+    gc.collect()
+
+@bot.message_handler(commands=['help'])
+def help_cmd(message):
+    save_chat(message.chat)
+    bot.send_message(
+        message.chat.id,
+        "🎵 *Lyrics Bot Guide*\n\n"
+        "🔹 *DM:* Type song name\n"
+        "🔹 *Groups:* /lyrics songname\n"
+        "🔹 *Send MP3:* I'll lyricize it!\n\n"
+        "/random /trending /top /stats",
+        reply_markup=get_menu_markup(message.from_user.id),
+        parse_mode='Markdown'
+    )
+    gc.collect()
+
+@bot.message_handler(commands=['stats'])
+def send_stats(message):
+    save_chat(message.chat)
+    uptime = datetime.now() - START_TIME
+    hours = uptime.total_seconds() // 3600
+    text = (
+        f"📊 *Stats*\n\n"
+        f"🔍 Searches: {stats['searches']}\n"
+        f"🎵 Delivered: {stats['lyrics_delivered']}\n"
+        f"🎲 Random: {stats['random_used']}\n"
+        f"⏱ Uptime: {int(hours)}h"
+    )
+    bot.reply_to(message, text, parse_mode='Markdown')
+    gc.collect()
+
+@bot.message_handler(commands=['top'])
+def send_top(message):
+    save_chat(message.chat)
+    if not search_counts:
+        bot.reply_to(message, "📭 No searches yet.")
+        return
+    sorted_songs = sorted(search_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    lines = [f"{i+1}. {q} - {c}" for i, (q, c) in enumerate(sorted_songs)]
+    text = "🏆 *Top Searches*\n\n" + "\n".join(lines)
+    bot.reply_to(message, text, parse_mode='Markdown')
+    gc.collect()
+
+@bot.message_handler(commands=['trending'])
+def send_trending(message):
+    save_chat(message.chat)
+    picks = random.sample(TRENDING_POOL, min(6, len(TRENDING_POOL)))
+    markup = types.InlineKeyboardMarkup()
+    for pick in picks:
+        markup.add(types.InlineKeyboardButton(
+            text=f"🔥 {pick[:30]}",
+            callback_data=f"trend_{pick[:40]}"
+        ))
+    bot.send_message(message.chat.id, "🔥 *Trending*:", reply_markup=markup, parse_mode='Markdown')
+    gc.collect()
+
+@bot.message_handler(commands=['random'])
+def random_song(message):
+    save_chat(message.chat)
+    stats['random_used'] += 1
+    query = random.choice(RANDOM_QUERIES)
+    status = bot.reply_to(message, f"🎲 Fetching *{query}*...", parse_mode='Markdown')
+    try:
+        res = requests.get(f"https://lrclib.net/api/search?q={query}", timeout=10)
+        results = res.json()[:6]
+        if not results:
+            bot.edit_message_text("No results.", message.chat.id, status.message_id)
+            return
+        
+        pick = random.choice(results)
+        track_id = pick.get('id')
+        t = get_lyrics_by_track_id(track_id)
+        
+        if not t:
+            bot.edit_message_text("Error fetching track.", message.chat.id, status.message_id)
+            return
+        
+        info = f"🎲 *{t.get('artistName', 'Unknown')[:30]} — {t.get('trackName', 'Unknown')[:30]}*\n💿 {t.get('albumName', 'N/A')[:30]}"
+        
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            types.InlineKeyboardButton("Synced File", callback_data=f"sf_{track_id}"),
+            types.InlineKeyboardButton("Synced Text", callback_data=f"st_{track_id}"),
+            types.InlineKeyboardButton("Plain File", callback_data=f"pf_{track_id}"),
+            types.InlineKeyboardButton("Plain Text", callback_data=f"pt_{track_id}")
+        )
+        markup.add(types.InlineKeyboardButton("🎲 Another", callback_data="random"))
+        bot.edit_message_text(info, message.chat.id, status.message_id,
+                              reply_markup=markup, parse_mode='Markdown')
+        gc.collect()
+    except Exception as e:
+        print(f"[ERROR] Random error: {e}")
+        try:
+            bot.edit_message_text("Error.", message.chat.id, status.message_id)
+        except:
+            pass
+
+@bot.message_handler(commands=['lyrics', 'search'])
+def lyrics_cmd(message):
+    save_chat(message.chat)
+    if not admin_db.is_admin(message.from_user.id):
+        bot_username = bot.get_me().username
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("Start Bot", url=f"https://t.me/{bot_username}?start=true"))
+        bot.reply_to(message, "⛔ Access Denied.", reply_markup=markup, parse_mode='Markdown')
+        return
+    
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: `/lyrics songname`", parse_mode='Markdown')
+        return
+    do_search(message, parts[1].strip()[:100])
+
+@bot.message_handler(commands=['addadmin'])
+def addadmin_cmd(message):
+    save_chat(message.chat)
+    if message.from_user.id != OWNER_ID:
+        bot.reply_to(message, "⛔ Owner only.")
+        return
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        bot.reply_to(message, "Usage: /addadmin userid")
+        return
+    admin_db.add_admin(parts[1])
+    bot.reply_to(message, f"✅ User added.", parse_mode="Markdown")
+    gc.collect()
+
+@bot.message_handler(commands=['removeadmin'])
+def removeadmin_cmd(message):
+    save_chat(message.chat)
+    if message.from_user.id != OWNER_ID:
+        bot.reply_to(message, "⛔ Owner only.")
+        return
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        bot.reply_to(message, "Usage: /removeadmin userid")
+        return
+    admin_db.remove_admin(parts[1])
+    bot.reply_to(message, f"✅ User removed.", parse_mode="Markdown")
+    gc.collect()
+
+@bot.message_handler(commands=['admins'])
+def admins_cmd(message):
+    save_chat(message.chat)
+    if not admin_db.is_admin(message.from_user.id):
+        bot.reply_to(message, "⛔ Admin only.")
+        return
+    admin_list = admin_db.get_all_admins()
+    if not admin_list:
+        bot.reply_to(message, "📭 No admins.")
+    else:
+        lines = "\n".join([f"{i+1}. `{uid}`" for i, uid in enumerate(admin_list[:20])])
+        bot.reply_to(message, f"👥 *Admins*\n\n{lines}", parse_mode='Markdown')
+    gc.collect()
+
+@bot.message_handler(commands=['broadcast'])
+def broadcast(message):
+    save_chat(message.chat)
+    if not admin_db.is_admin(message.from_user.id):
+        bot.reply_to(message, "⛔ Admin only.")
+        return
+    if message.chat.type != 'private':
+        bot.reply_to(message, "⚠️ Use in DM.")
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: `/broadcast message`", parse_mode='Markdown')
+        return
+    text = parts[1][:200]
+    chat_ids = get_all_target_chats()
+    sent, failed = 0, 0
+    for cid in chat_ids[:100]:
+        try:
+            bot.send_message(cid, f"📢 *Announcement*\n\n{text}", parse_mode='Markdown')
+            sent += 1
+        except:
+            failed += 1
     bot.reply_to(message, f"✅ Sent: {sent} ❌ Failed: {failed}")
     gc.collect()
 
