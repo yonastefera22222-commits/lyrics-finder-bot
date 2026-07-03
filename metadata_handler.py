@@ -22,6 +22,7 @@ def read_id3v2_metadata(file_path):
                     print("[DEBUG] No tags found, using filename")
                     artist = "Unknown Artist"
                     title = os.path.splitext(os.path.basename(file_path))[0]
+                    album = "Unknown Album"
                 else:
                     artist = str(tags.get('TPE1', 'Unknown Artist')).strip()
                     title = str(tags.get('TIT2', 'Unknown Track')).strip()
@@ -82,7 +83,7 @@ def embed_lyrics_in_file(file_path, lyrics_text, lyrics_type="plain"):
                 text=[lyrics_text[:5000]]
             )
         except Exception as comm_error:
-            print(f"[ERROR] COMM frame error: {comm_error}")
+            print(f"[DEBUG] COMM frame with desc failed, trying without: {comm_error}")
             # Try without description
             audio['COMM'] = COMM(
                 encoding=3,
@@ -91,7 +92,7 @@ def embed_lyrics_in_file(file_path, lyrics_text, lyrics_type="plain"):
                 text=[lyrics_text[:5000]]
             )
         
-        # Save the tags
+        # Save the tags with padding
         audio.save(v2_version=3, padding=lambda x: 2048)
         print(f"[DEBUG] Lyrics ({lyrics_type}) embedded successfully: {len(lyrics_text)} chars")
         return True
