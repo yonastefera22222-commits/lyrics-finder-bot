@@ -50,6 +50,30 @@ FILE_EXPIRY_HOURS = 24  # 24 hours
 ITUNES_COUNTRY = os.environ.get('ITUNES_COUNTRY', 'US')
 ITUNES_LIMIT = int(os.environ.get('ITUNES_LIMIT', '8'))
 
+# --- SUPPORTED AUDIO ---
+# Telegram's Bot API only lets bots download files up to 20 MB, and Render's
+# free tier has little RAM/disk, so keep a safe cap below that.
+MAX_FILE_MB = int(os.environ.get('MAX_FILE_MB', '15'))
+MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
+
+SUPPORTED_AUDIO_EXTS = {
+    '.mp3', '.m4a', '.mp4', '.m4b', '.mov',
+    '.flac', '.wav', '.aiff', '.aif',
+    '.ogg', '.oga', '.opus',
+}
+AUDIO_MIME_TO_EXT = {
+    'audio/mpeg': '.mp3', 'audio/mp3': '.mp3', 'audio/x-mpeg': '.mp3',
+    'audio/mp4': '.m4a', 'audio/m4a': '.m4a', 'audio/x-m4a': '.m4a',
+    'audio/aac': '.m4a', 'audio/x-aac': '.m4a',
+    'video/mp4': '.mp4', 'video/quicktime': '.mov',
+    'audio/flac': '.flac', 'audio/x-flac': '.flac',
+    'audio/ogg': '.ogg', 'application/ogg': '.ogg', 'audio/x-ogg': '.ogg',
+    'audio/opus': '.opus', 'audio/x-opus+ogg': '.opus', 'audio/ogg; codecs=opus': '.opus',
+    'audio/wav': '.wav', 'audio/x-wav': '.wav', 'audio/wave': '.wav', 'audio/vnd.wave': '.wav',
+    'audio/aiff': '.aiff', 'audio/x-aiff': '.aiff',
+}
+SUPPORTED_LIST = "MP3, M4A/MP4, M4B, FLAC, WAV, AIFF, OGG/OPUS"
+
 def normalize_str(s):
     if not s:
         return ""
@@ -556,17 +580,28 @@ def do_search(message, query):
             return
 
         # 2) Fallback: original lrclib search and ranking if no iTunes matches
-        res = requests.get(f"https://lrclib.net/api/search?q={query[:50]}", timeout=10)
-        results = res.json()[:10]
+        res = requests.get(f"https://lrclib.net/api/search?q={requests.utils.quote(query[:80])}", timeout=10)
+        try:
+            results = res.json() if isinstance(res.json(), list) else []
+        except Exception:
+            results = []
 
-        query_low = query.strip().lower()
-        filtered = [
-            track for track in results
-            if query_low in track.get('trackName', '').lower() or
-               query_low in track.get('artistName', '').lower()
-        ][:6]
+        # Rank results by fuzzy match against the query (title + artist)
+        ranked = []
+        seen_ids = set()
+        for track in results:
+            tid = track.get('id')
+            if tid in seen_ids:
+                continue
+            seen_ids.add(tid)
+            artist = track.get('artistName', '') or ''
+            title = track.get('trackName', '') or ''
+            # Use the whole query as both artist and title hint for scoring
+            score = score_track_match('', query, artist, title)
+            ranked.append((score, track))
 
-        display_tracks = filtered if filtered else results[:6]
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        display_tracks = [t for _, t in ranked[:8]]
 
         if not display_tracks:
             try:
@@ -585,7 +620,8 @@ def do_search(message, query):
         for track in display_tracks:
             artist = track.get('artistName', 'Unknown')[:25]
             title = track.get('trackName', 'Unknown')[:25]
-            btn_text = f"{artist} — {title}"
+            album = (track.get('albumName') or '')[:18]
+            btn_text = f"{artist} — {title}" + (f" ({album})" if album else "")
             markup.add(types.InlineKeyboardButton(text=btn_text, callback_data=f"sel_{track.get('id')}"))
 
         prompt = "Select a version:" if requester else "Results:"
@@ -863,7 +899,125 @@ def dm_search(message):
     do_search(message, query[:100])
 
 # --- MUSIC FILE HANDLER ---
-@bot.message_handler(content_types=['audio', 'document'])
+def detect_audio_ext(message, file_info=None):
+    """Work out the real extension of an uploaded file.
+
+    Telegram does not always keep the extension in file_info.file_path, and an
+    .mp4 arrives as content type "video" (not "audio"), so prefer the original
+    file name, then the mime type, then the path.
+    """
+    exts = []
+    for attr in ('audio', 'document', 'video', 'voice'):
+        obj = getattr(message, attr, None)
+        if obj is None:
+            continue
+        name = getattr(obj, 'file_name', None)
+        if name:
+            exts.append(os.path.splitext(name)[1].lower())
+        mime = (getattr(obj, 'mime_type', None) or '').lower()
+        if mime:
+            exts.append(AUDIO_MIME_TO_EXT.get(mime, ''))
+    if file_info is not None:
+        exts.append(os.path.splitext(getattr(file_info, 'file_path', '') or '')[1].lower())
+    for ext in exts:
+        if ext in SUPPORTED_AUDIO_EXTS:
+            return ext
+    # Only guess when Telegram told us nothing at all; otherwise report the real
+    # (unsupported) extension so the user gets a clear message instead of a
+    # confusing download error.
+    if not [e for e in exts if e]:
+        return '.mp3'
+    return None
+
+def guess_artist_title_from_filename(original_name):
+    """'Artist - Title (Official Audio).mp3' -> ('Artist', 'Title')."""
+    if not original_name:
+        return None, None
+    base = os.path.splitext(os.path.basename(str(original_name)))[0]
+    base = base.replace('_', ' ')
+    base = re.sub(
+        r'[\(\[]\s*(official|lyric|lyrics|audio|video|hd|hq|4k|mv|music video|visualizer|explicit|remaster(ed)?)[^\)\]]*[\)\]]',
+        ' ', base, flags=re.IGNORECASE)
+    base = re.sub(r'\s+', ' ', base).strip(' -\u2013\u2014')
+    parts = re.split(r'\s+[-\u2013\u2014]\s+', base, maxsplit=1)
+    if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+        return parts[0].strip()[:80], parts[1].strip()[:80]
+    return None, (base[:80] or None)
+
+def find_track_for_metadata(metadata, original_name):
+    """Find lyrics for an upload, falling back to the original file name.
+
+    Many downloaded songs carry no tags at all, so lrclib cannot be searched by
+    artist/title - in that case the file name usually still holds
+    "Artist - Title".
+    """
+    artist = (metadata.get('artist') or '').strip()
+    title = (metadata.get('title') or '').strip()
+
+    if metadata.get('has_real_tags'):
+        track = search_lyrics_by_metadata(artist, title)
+        if track:
+            return track
+
+    file_artist, file_title = guess_artist_title_from_filename(original_name)
+    attempts = []
+    if file_artist and file_title:
+        attempts.append((file_artist, file_title))
+        attempts.append((file_title, file_artist))
+    if title:
+        attempts.append((artist, title))
+    if file_title:
+        attempts.append((artist, file_title))
+
+    tried = set()
+    for a, t in attempts:
+        key = (a.lower(), t.lower())
+        if key in tried or not t:
+            continue
+        tried.add(key)
+        track = search_lyrics_by_metadata(a, t)
+        if track:
+            return track
+    return None
+
+def rehydrate_tracked_file(entry):
+    """Return a usable local path, re-downloading from Telegram if needed.
+
+    Render's free tier wipes /tmp on every restart/spin-down, so the upload may
+    be gone by the time the user taps "Lyricize". Telegram still stores it, and
+    the file_id saved in the database lets us fetch it again.
+    """
+    path = entry.get('file_path')
+    if path and os.path.exists(path):
+        return path
+
+    file_id = entry.get('file_id')
+    if not file_id:
+        return None
+
+    try:
+        print("[DEBUG] Local file missing - re-downloading from Telegram")
+        file_info = bot.get_file(file_id)
+        data = bot.download_file(file_info.file_path)
+        if not data:
+            return None
+        if not path:
+            ext = os.path.splitext(file_info.file_path or '')[1] or '.mp3'
+            path = os.path.join('/tmp', f"music_redownload{ext}")
+        os.makedirs(os.path.dirname(path) or '/tmp', exist_ok=True)
+        with open(path, 'wb') as f:
+            f.write(data)
+        try:
+            admin_db.update_file_path(entry.get('file_name'), path)
+        except Exception:
+            pass
+        print(f"[DEBUG] Re-downloaded expired file to {path}")
+        return path
+    except Exception as e:
+        print(f"[ERROR] Re-download failed: {e}")
+        return None
+
+@bot.message_handler(content_types=['audio', 'document', 'video', 'voice'])
 def handle_music_file(message):
     global last_cleanup
 
@@ -884,53 +1038,81 @@ def handle_music_file(message):
         bot.reply_to(message, "⛔ Access Denied.", reply_markup=markup, parse_mode='Markdown')
         return
 
-    # Check file size (max 15MB)
-    file_size = None
-    if message.content_type == 'audio' and message.audio:
-        file_size = message.audio.file_size
-    elif message.content_type == 'document' and message.document:
-        file_size = message.document.file_size
-
-    if file_size and file_size > 15 * 1024 * 1024:
-        bot.reply_to(message, "❌ File too large (max 15MB)")
+    if message.voice:
+        bot.reply_to(
+            message,
+            "🎤 Voice notes can't be matched to a song.\n"
+            f"Send the track as an audio file or document instead ({SUPPORTED_LIST})."
+        )
         return
 
-    file_info = None
-    if message.content_type == 'audio':
-        file_info = bot.get_file(message.audio.file_id)
-    elif message.content_type == 'document':
-        if message.document.mime_type and 'audio' in message.document.mime_type:
-            file_info = bot.get_file(message.document.file_id)
+    media = None
+    content_type = None
+    for attr in ('audio', 'document', 'video'):
+        obj = getattr(message, attr, None)
+        if obj is not None:
+            media = obj
+            content_type = attr
+            break
 
-    if not file_info:
+    if media is None:
         bot.reply_to(message, "❌ Invalid audio file.")
         return
+
+    original_name = getattr(media, 'file_name', None)
+    mime = (getattr(media, 'mime_type', None) or '').lower()
+    file_size = getattr(media, 'file_size', None) or 0
+
+    ext = detect_audio_ext(message, None)
+    if ext not in SUPPORTED_AUDIO_EXTS:
+        bot.reply_to(
+            message,
+            f"❌ Unsupported file type ({mime or 'unknown'}).\n"
+            f"Supported formats: {SUPPORTED_LIST}."
+        )
+        return
+
+    if file_size and file_size > MAX_FILE_BYTES:
+        bot.reply_to(
+            message,
+            f"❌ File too large (max {MAX_FILE_MB}MB).\n"
+            "Telegram also caps how big a file a bot can download (20MB)."
+        )
+        return
+
+    try:
+        file_info = bot.get_file(media.file_id)
+    except Exception as e:
+        print(f"[ERROR] get_file failed: {e}")
+        bot.reply_to(message, "❌ Could not read that file from Telegram. Please send it again.")
+        return
+
+    ext = detect_audio_ext(message, file_info)
 
     progress_msg = bot.reply_to(message, "⏳ Processing...")
 
     try:
-        print(f"\n[DEBUG] ===== MUSIC FILE PROCESSING START =====")
+        print(f"\n[DEBUG] ===== MUSIC FILE PROCESSING START ({content_type}, {ext}) =====")
 
         downloaded_file = bot.download_file(file_info.file_path)
-        # Create unique per-request directory under /tmp to avoid collisions and follow ephemeral practice
+
+        # unique per-request directory under /tmp (ephemeral host friendly)
         safe_dir = f"music_{user_id}_{int(datetime.now().timestamp())}"
         tmpdir = os.path.join('/tmp', safe_dir)
         os.makedirs(tmpdir, exist_ok=True)
-        # Preserve original extension if present
-        ext = os.path.splitext(file_info.file_path)[1] or '.mp3'
-        file_name = f"song{ext}"
+
+        # dash-only unique name: safe inside callback_data (64 byte API limit)
+        # and it stops two users' uploads from overwriting each other.
+        file_name = f"song-{user_id}-{int(time.time())}{ext}"
         file_path = os.path.join(tmpdir, file_name)
 
         print(f"[DEBUG] Saving to temp storage: {file_path}")
 
         with open(file_path, 'wb') as f:
-            # downloaded_file is bytes
             f.write(downloaded_file)
 
-        print(f"[DEBUG] File saved successfully")
-        time.sleep(1)  # Ensure file is written
+        print(f"[DEBUG] File saved successfully ({len(downloaded_file)} bytes)")
 
-        # Verify file exists
         if not os.path.exists(file_path):
             print(f"[ERROR] File not saved: {file_path}")
             bot.edit_message_text("❌ File save failed.", message.chat.id, progress_msg.message_id)
@@ -943,83 +1125,97 @@ def handle_music_file(message):
         metadata = extract_music_metadata(file_path)
 
         if not metadata:
-            print(f"[ERROR] Failed to extract metadata")
-            bot.edit_message_text("❌ Cannot read file metadata. Make sure the file has proper tags or is valid.", message.chat.id, progress_msg.message_id)
+            print("[ERROR] Failed to extract metadata")
+            bot.edit_message_text(
+                f"❌ Cannot read this file. Supported formats: {SUPPORTED_LIST}.",
+                message.chat.id, progress_msg.message_id)
             try:
                 os.remove(file_path)
-            except:
+            except Exception:
                 pass
-            print(f"[DEBUG] ===== MUSIC FILE PROCESSING END (FAILED) =====\n")
+            print("[DEBUG] ===== MUSIC FILE PROCESSING END (FAILED) =====\n")
             return
 
-        artist = metadata.get('artist', 'Unknown')
-        title = metadata.get('title', 'Unknown')
+        artist = (metadata.get('artist') or 'Unknown')[:60]
+        title = (metadata.get('title') or 'Unknown')[:60]
 
-        print(f"[DEBUG] Extracted: Artist={artist}, Title={title}")
+        print(f"[DEBUG] Extracted: Artist={artist}, Title={title}, tags={metadata.get('has_real_tags')}")
 
-        bot.edit_message_text(f"🔍 Searching: *{artist[:20]} - {title[:20]}*...",
-                            message.chat.id, progress_msg.message_id, parse_mode='Markdown')
+        # plain text (no parse_mode): titles with _, *, [ ] used to break the
+        # Markdown parser and killed the whole flow with an unhandled error.
+        bot.edit_message_text(
+            f"🔍 Searching: {artist[:25]} - {title[:25]}...",
+            message.chat.id, progress_msg.message_id)
 
-        track = search_lyrics_by_metadata(artist, title)
+        track = find_track_for_metadata(metadata, original_name)
 
         if not track:
-            print(f"[ERROR] Track not found in API")
-            bot.edit_message_text("❌ Lyrics not found for this song.", message.chat.id, progress_msg.message_id)
+            print("[ERROR] Track not found in API")
+            bot.edit_message_text(
+                "❌ Lyrics not found for this song.\n"
+                "Tip: make sure the song has proper tags, or name the file like\n"
+                "'Artist - Title.mp3'.",
+                message.chat.id, progress_msg.message_id)
             try:
                 os.remove(file_path)
-            except:
+            except Exception:
                 pass
+            print("[DEBUG] ===== MUSIC FILE PROCESSING END (NOT FOUND) =====\n")
             return
 
-        print(f"[DEBUG] Track found: {track}")
+        print(f"[DEBUG] Track found: {track.get('artistName')} - {track.get('trackName')} (id={track.get('id')})")
         track_id = track.get('id')
         if not track_id:
-            print(f"[ERROR] Track has no ID")
+            print("[ERROR] Track has no ID")
             bot.edit_message_text("❌ Invalid track data.", message.chat.id, progress_msg.message_id)
             try:
                 os.remove(file_path)
-            except:
+            except Exception:
                 pass
             return
 
         lyrics_data = get_lyrics_by_track_id(track_id)
 
         if not lyrics_data:
-            print(f"[ERROR] Could not fetch lyrics data")
+            print("[ERROR] Could not fetch lyrics data")
             bot.edit_message_text("❌ Cannot fetch lyrics for this track.", message.chat.id, progress_msg.message_id)
             try:
                 os.remove(file_path)
-            except:
+            except Exception:
                 pass
             return
 
         has_synced = bool(lyrics_data.get('syncedLyrics'))
         has_plain = bool(lyrics_data.get('plainLyrics'))
-
         print(f"[DEBUG] Synced: {has_synced}, Plain: {has_plain}")
 
         if not has_synced and not has_plain:
-            print(f"[ERROR] No lyrics available")
+            print("[ERROR] No lyrics available")
             bot.edit_message_text("❌ No lyrics available for this track.", message.chat.id, progress_msg.message_id)
             try:
                 os.remove(file_path)
-            except:
+            except Exception:
                 pass
             return
 
         try:
             bot.delete_message(message.chat.id, progress_msg.message_id)
-        except:
+        except Exception:
             pass
 
-        # Save tracking info - store full path so embed callback can find it
-        admin_db.save_file_tracking(file_name, file_path, track_id)
+        # track the upload (keeps file_id so it can be re-downloaded later)
+        admin_db.save_file_tracking(
+            file_name, file_path, track_id,
+            file_id=media.file_id, user_id=user_id, original_name=original_name
+        )
 
-        info_text = (f"✅ Found:\n\n"
-                    f"🎵 *{lyrics_data.get('artistName', 'Unknown')[:30]}*\n"
-                    f"📝 {lyrics_data.get('trackName', 'Unknown')[:30]}\n\n"
-                    f"{'✓ Synced' if has_synced else '✗ Synced'}\n"
-                    f"{'✓ Plain' if has_plain else '✗ Plain'}")
+        info_text = (
+            "✅ Found:\n\n"
+            f"🎵 {lyrics_data.get('artistName', 'Unknown')[:40]}\n"
+            f"📝 {lyrics_data.get('trackName', 'Unknown')[:40]}\n\n"
+            f"{'✓ Synced' if has_synced else '✗ Synced'}\n"
+            f"{'✓ Plain' if has_plain else '✗ Plain'}"
+        )
 
         markup = types.InlineKeyboardMarkup()
         markup.row(
@@ -1027,8 +1223,8 @@ def handle_music_file(message):
             types.InlineKeyboardButton("🎵 Lyricize", callback_data=f"prepare_embed_{file_name}_{track_id}")
         )
 
-        bot.send_message(message.chat.id, info_text, reply_markup=markup, parse_mode='Markdown')
-        print(f"[DEBUG] ===== MUSIC FILE PROCESSING END (SUCCESS) =====\n")
+        bot.send_message(message.chat.id, info_text, reply_markup=markup)
+        print("[DEBUG] ===== MUSIC FILE PROCESSING END (SUCCESS) =====\n")
         gc.collect()
 
     except Exception as e:
@@ -1036,10 +1232,10 @@ def handle_music_file(message):
         import traceback
         traceback.print_exc()
         try:
-            bot.edit_message_text(f"❌ Error: {str(e)[:50]}", message.chat.id, progress_msg.message_id)
-        except:
+            bot.edit_message_text(f"❌ Error: {str(e)[:80]}", message.chat.id, progress_msg.message_id)
+        except Exception:
             pass
-        print(f"[DEBUG] ===== MUSIC FILE PROCESSING END (EXCEPTION) =====\n")
+        print("[DEBUG] ===== MUSIC FILE PROCESSING END (EXCEPTION) =====\n")
         gc.collect()
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('view_lyrics_'))
@@ -1073,16 +1269,21 @@ def view_lyrics_callback(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('prepare_embed_'))
 def prepare_embed_callback(call):
-    """Prepare embedding - show options"""
+    """Show the lyrics-type options for embedding."""
     save_chat(call.message.chat)
-    parts = call.data.split('_')
-    file_name = parts[2]
-    track_id = parts[3]
+
+    # file names are dash-separated on purpose, so a plain rsplit is safe
+    payload = call.data[len('prepare_embed_'):]
+    file_name, _, track_id = payload.rpartition('_')
+    if not file_name or not track_id:
+        bot.answer_callback_query(call.id, "Old button - please send the song again.")
+        return
+
+    bot.answer_callback_query(call.id)
 
     lyrics_data = get_lyrics_by_track_id(track_id)
-
     if not lyrics_data:
-        bot.answer_callback_query(call.id, "Error fetching lyrics.")
+        bot.send_message(call.message.chat.id, "❌ Error fetching lyrics. Please try again.")
         return
 
     has_synced = bool(lyrics_data.get('syncedLyrics'))
@@ -1091,46 +1292,59 @@ def prepare_embed_callback(call):
     markup = types.InlineKeyboardMarkup()
 
     if has_synced:
-        markup.add(types.InlineKeyboardButton("✨ Synced", callback_data=f"do_embed_{file_name}_{track_id}_synced"))
+        markup.add(types.InlineKeyboardButton(
+            "✨ Synced", callback_data=f"do_embed_{file_name}_{track_id}_synced"))
     if has_plain:
-        markup.add(types.InlineKeyboardButton("✨ Plain", callback_data=f"do_embed_{file_name}_{track_id}_plain"))
+        markup.add(types.InlineKeyboardButton(
+            "✨ Plain", callback_data=f"do_embed_{file_name}_{track_id}_plain"))
+
+    if not has_synced and not has_plain:
+        bot.send_message(call.message.chat.id, "❌ No lyrics available for this track.")
+        return
 
     bot.send_message(call.message.chat.id, "Choose lyrics type to embed:", reply_markup=markup)
     gc.collect()
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('do_embed_'))
 def do_embed_callback(call):
-    """Do actual embedding"""
+    """Embed the chosen lyrics into the uploaded file and send it back."""
     save_chat(call.message.chat)
-    parts = call.data.split('_')
-    file_name = parts[2]
-    track_id = parts[3]
-    lyrics_type = parts[4]
 
+    try:
+        file_name, track_id, lyrics_type = call.data[len('do_embed_'):].rsplit('_', 2)
+    except ValueError:
+        bot.answer_callback_query(call.id, "Old button - please send the song again.")
+        return
+
+    lyrics_type = 'synced' if lyrics_type == 'synced' else 'plain'
+
+    bot.answer_callback_query(call.id, "Embedding lyrics...")
     msg = bot.send_message(call.message.chat.id, "⏳ Embedding lyrics...")
 
     try:
-        # Get file path from database
-        file_info = admin_db.get_file_tracking(file_name)
-        if not file_info:
-            bot.edit_message_text("❌ File tracking not found.", call.message.chat.id, msg.message_id)
+        # Look the upload up; on Render the local copy may already be gone
+        entry = admin_db.get_file_tracking(file_name)
+        if not entry:
+            bot.edit_message_text("❌ File tracking not found. Please send the song again.",
+                                  call.message.chat.id, msg.message_id)
             return
 
-        file_path = file_info['file_path']
-
-        # Verify file still exists
-        if not os.path.exists(file_path):
-            print(f"[ERROR] File not found: {file_path}")
-            bot.edit_message_text("❌ File expired. Please send the music file again.", call.message.chat.id, msg.message_id)
+        entry['file_name'] = file_name
+        file_path = rehydrate_tracked_file(entry)
+        if not file_path:
+            print(f"[ERROR] File not found and could not re-download: {file_name}")
+            bot.edit_message_text(
+                "❌ This song is no longer on the server.\n"
+                "Please send it again and tap 🎵 Lyricize straight away.",
+                call.message.chat.id, msg.message_id)
             return
 
         lyrics_data = get_lyrics_by_track_id(track_id)
+        if not lyrics_data:
+            bot.edit_message_text("❌ Cannot fetch lyrics for this track.", call.message.chat.id, msg.message_id)
+            return
 
-        if lyrics_type == "synced":
-            lyrics_content = lyrics_data.get('syncedLyrics')
-        else:
-            lyrics_content = lyrics_data.get('plainLyrics')
-
+        lyrics_content = lyrics_data.get('syncedLyrics') if lyrics_type == "synced" else lyrics_data.get('plainLyrics')
         if not lyrics_content:
             bot.edit_message_text("❌ Lyrics unavailable for this type.", call.message.chat.id, msg.message_id)
             return
@@ -1152,25 +1366,33 @@ def do_embed_callback(call):
                 pass
 
         if not success:
-            bot.edit_message_text("❌ Failed to embed lyrics.", call.message.chat.id, msg.message_id)
+            bot.edit_message_text(
+                f"❌ Could not add lyrics to this file.\n"
+                f"Supported formats: {SUPPORTED_LIST}.",
+                call.message.chat.id, msg.message_id)
             return
 
         bot.edit_message_text("⏳ Sending lyricized file...", call.message.chat.id, msg.message_id)
-        time.sleep(1)
 
-        artist = lyrics_data.get('artistName', 'Unknown')[:25]
-        title = lyrics_data.get('trackName', 'Unknown')[:25]
+        artist = (lyrics_data.get('artistName') or 'Unknown')[:40]
+        title = (lyrics_data.get('trackName') or 'Unknown')[:40]
+        out_ext = os.path.splitext(file_path)[1] or '.mp3'
+        safe_name = re.sub(r'[^\w\-. ]', '', f"{artist} - {title}")[:60].strip() or "lyricized"
 
         with open(file_path, 'rb') as f:
-            bot.send_document(call.message.chat.id, f, caption=f"🎵 {artist} - {title}\n✨ Lyricized ({lyrics_type})!")
+            bot.send_document(
+                call.message.chat.id, f,
+                caption=f"🎵 {artist} - {title}\n✨ Lyrics embedded ({lyrics_type})",
+                visible_file_name=f"{safe_name} ({lyrics_type}){out_ext}"
+            )
 
         try:
             bot.delete_message(call.message.chat.id, msg.message_id)
-        except:
+        except Exception:
             pass
 
         stats['lyrics_delivered'] += 1
-        print(f"[DEBUG] File will expire in {FILE_EXPIRY_HOURS} hours")
+        print(f"[DEBUG] Lyricized file sent ({lyrics_type}). Local copy kept for {FILE_EXPIRY_HOURS}h")
         gc.collect()
 
     except Exception as e:
@@ -1178,8 +1400,8 @@ def do_embed_callback(call):
         import traceback
         traceback.print_exc()
         try:
-            bot.edit_message_text(f"❌ Error: {str(e)[:50]}", call.message.chat.id, msg.message_id)
-        except:
+            bot.edit_message_text(f"❌ Error: {str(e)[:80]}", call.message.chat.id, msg.message_id)
+        except Exception:
             pass
         gc.collect()
 
@@ -1218,7 +1440,16 @@ def show_options(call):
         bot.answer_callback_query(call.id, "Error.")
         return
 
-    info = f"🎵 *{t.get('artistName', 'Unknown')[:25]}*\n📝 {t.get('trackName', 'Unknown')[:25]}"
+    artist = t.get('artistName', 'Unknown')
+    title = t.get('trackName', 'Unknown')
+    album = t.get('albumName') or ''
+    duration = t.get('duration')
+    dur_str = f"{duration//60}:{duration%60:02d}" if duration else ""
+    info = f"🎵 *{artist[:30]}*\n📝 {title[:30]}"
+    if album:
+        info += f"\n💿 {album[:30]}"
+    if dur_str:
+        info += f"\n⏱ {dur_str}"
 
     markup = types.InlineKeyboardMarkup(row_width=2)
     if t.get('syncedLyrics'):
