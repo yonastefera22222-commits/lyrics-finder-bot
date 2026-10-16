@@ -1,3 +1,4 @@
+# metadata_handler.py
 import os
 import logging
 import tempfile
@@ -149,19 +150,32 @@ def embed_lyrics_in_file(file_path, lyrics_text, lyrics_type="plain"):
             logger.error("empty lyrics provided")
             return False
 
-        # Limit size (40KB) to be safe
-        max_bytes = 40 * 1024
-        if len(lyrics_text.encode('utf-8')) > max_bytes:
-            logger.debug("lyrics too large, truncating")
-            # keep reasonably long but bounded
-            lyrics_text = lyrics_text.encode('utf-8')[:max_bytes].decode('utf-8', errors='ignore')
+        # Limit size to avoid excessive tag sizes (configurable)
+        max_bytes = 200 * 1024  # increased to 200KB to allow longer lyrics (adjustable)
+        raw = lyrics_text
+        encoded = raw.encode('utf-8')
+        if len(encoded) > max_bytes:
+            logger.debug("lyrics too large (%d bytes), truncating to %d bytes", len(encoded), max_bytes)
+            # truncate safely on UTF-8 char boundary
+            encoded = encoded[:max_bytes]
+            # drop any partial trailing multi-byte sequence
+            while True:
+                try:
+                    raw = encoded.decode('utf-8')
+                    break
+                except UnicodeDecodeError:
+                    encoded = encoded[:-1]
+                    if not encoded:
+                        raw = ""
+                        break
+            lyrics_text = raw
 
         audio = MutagenFile(file_path, easy=False)
         if audio is None:
             logger.error("unsupported or unreadable file for embedding: %s", file_path)
             return False
 
-        # MP3 -> ID3 USLT for plain. For synced LRC, store as COMM with desc 'synced' and also keep USLT if plain.
+        # MP3 -> ID3 USLT for plain. For synced LRC, store as COMM with desc 'synced'
         if isinstance(audio, MP3) or file_path.lower().endswith('.mp3'):
             try:
                 try:
@@ -171,37 +185,60 @@ def embed_lyrics_in_file(file_path, lyrics_text, lyrics_type="plain"):
                     id3 = ID3()
 
                 if lyrics_type == 'plain':
+                    # Remove existing USLT frames (keep other frames intact)
+                    try:
+                        id3.delall('USLT')
+                    except Exception:
+                        pass
                     uslt = USLT(encoding=3, lang='eng', desc='', text=lyrics_text)
-                    id3.delall('USLT')
                     id3.add(uslt)
                 else:
-                    # synced: keep as COMM with description 'synced'
+                    # synced: remove only COMM frames with desc == 'synced', preserve others
+                    existing_comm = id3.getall('COMM')
+                    preserved = [f for f in existing_comm if getattr(f, 'desc', '') != 'synced']
+                    # clear all COMM frames then re-add preserved ones
+                    try:
+                        id3.delall('COMM')
+                    except Exception:
+                        pass
+                    for f in preserved:
+                        id3.add(f)
                     comm = COMM(encoding=3, lang='eng', desc='synced', text=[lyrics_text])
-                    id3.delall('COMM')
                     id3.add(comm)
 
+                # Save tags back to file
                 id3.save(file_path, v2_version=3, padding=2048)
             except Exception:
                 logger.exception("Failed to write ID3 tags")
                 return False
 
-            # verify
+            # verify presence
             try:
                 id3_check = ID3(file_path)
-                if lyrics_type == 'plain' and id3_check.getall('USLT'):
-                    logger.debug("USLT present after save")
-                    return True
-                if lyrics_type == 'synced' and id3_check.getall('COMM'):
-                    logger.debug("COMM present after save")
-                    return True
-                logger.error("Verification failed for MP3 embedding")
-                return False
+                if lyrics_type == 'plain':
+                    uslt_frames = id3_check.getall('USLT')
+                    if uslt_frames:
+                        logger.debug("USLT present after save")
+                        return True
+                    else:
+                        logger.error("USLT not found after save")
+                        return False
+                else:
+                    comm_frames = id3_check.getall('COMM')
+                    # check for a COMM frame with desc 'synced'
+                    found = any(getattr(c, 'desc', '') == 'synced' for c in comm_frames)
+                    if found:
+                        logger.debug("COMM synced present after save")
+                        return True
+                    else:
+                        logger.error("COMM (synced) not found after save")
+                        return False
             except Exception:
                 logger.exception("Verification exception for MP3")
                 return False
 
         # MP4/M4A: MP4Tags '©lyr'
-        elif isinstance(audio, MP4) or file_path.lower().endswith(('.m4a', '.mp4')):
+        elif isinstance(audio, MP4) or file_path.lower().endswith(('.m4a', '.mp4', '.m4b')):
             try:
                 mp4 = MP4(file_path)
                 tags = mp4.tags or MP4Tags()
@@ -230,11 +267,11 @@ def embed_lyrics_in_file(file_path, lyrics_text, lyrics_type="plain"):
         elif isinstance(audio, FLAC) or file_path.lower().endswith('.flac'):
             try:
                 fl = FLAC(file_path)
-                # Vorbis-style tags: LYRICS or SYNCEDLYRICS
+                # Vorbis-style tags expect lists
                 if lyrics_type == 'plain':
-                    fl['LYRICS'] = lyrics_text
+                    fl['LYRICS'] = [lyrics_text]
                 else:
-                    fl['SYNCEDLYRICS'] = lyrics_text
+                    fl['SYNCEDLYRICS'] = [lyrics_text]
                 fl.save()
             except Exception:
                 logger.exception("Failed to write FLAC tags")
@@ -244,8 +281,10 @@ def embed_lyrics_in_file(file_path, lyrics_text, lyrics_type="plain"):
             try:
                 fl_check = FLAC(file_path)
                 if lyrics_type == 'plain' and fl_check.get('LYRICS'):
+                    logger.debug("FLAC LYRICS present after save")
                     return True
                 if lyrics_type == 'synced' and fl_check.get('SYNCEDLYRICS'):
+                    logger.debug("FLAC SYNCEDLYRICS present after save")
                     return True
                 logger.error("Verification failed for FLAC embedding")
                 return False
@@ -258,9 +297,9 @@ def embed_lyrics_in_file(file_path, lyrics_text, lyrics_type="plain"):
             try:
                 og = OggVorbis(file_path)
                 if lyrics_type == 'plain':
-                    og['LYRICS'] = lyrics_text
+                    og['LYRICS'] = [lyrics_text]
                 else:
-                    og['SYNCEDLYRICS'] = lyrics_text
+                    og['SYNCEDLYRICS'] = [lyrics_text]
                 og.save()
             except Exception:
                 logger.exception("Failed to write Ogg tags")
@@ -270,10 +309,12 @@ def embed_lyrics_in_file(file_path, lyrics_text, lyrics_type="plain"):
             try:
                 og_check = OggVorbis(file_path)
                 if lyrics_type == 'plain' and og_check.get('LYRICS'):
+                    logger.debug("OGG LYRICS present after save")
                     return True
                 if lyrics_type == 'synced' and og_check.get('SYNCEDLYRICS'):
+                    logger.debug("OGG SYNCEDLYRICS present after save")
                     return True
-                logger.error("Verification failed for OGG embedding")
+                logger.error("Verification failed for OGG")
                 return False
             except Exception:
                 logger.exception("Verification exception for OGG")
