@@ -9,6 +9,7 @@ from mutagen.mp3 import MP3
 from mutagen.flac import FLAC
 from mutagen.mp4 import MP4, MP4Tags
 from mutagen.oggvorbis import OggVorbis
+from mutagen.oggopus import OggOpus
 
 logger = logging.getLogger("metadata_handler")
 handler = logging.StreamHandler()
@@ -86,15 +87,25 @@ def read_id3v2_metadata(file_path):
             except Exception:
                 logger.exception("Error reading FLAC tags")
 
-        # Ogg Vorbis / Opus
-        elif isinstance(audio, OggVorbis) or file_path.lower().endswith(('.ogg', '.opus')):
+        # Ogg Vorbis
+        elif isinstance(audio, OggVorbis) or file_path.lower().endswith('.ogg'):
             try:
                 og = OggVorbis(file_path)
                 artist = sanitize_text(og.get('artist', [None])[0])
                 title = sanitize_text(og.get('title', [None])[0])
                 album = sanitize_text(og.get('album', [None])[0])
             except Exception:
-                logger.exception("Error reading Ogg tags")
+                logger.exception("Error reading Ogg Vorbis tags")
+
+        # Ogg Opus
+        elif isinstance(audio, OggOpus) or file_path.lower().endswith('.opus'):
+            try:
+                og = OggOpus(file_path)
+                artist = sanitize_text(og.get('artist', [None])[0])
+                title = sanitize_text(og.get('title', [None])[0])
+                album = sanitize_text(og.get('album', [None])[0])
+            except Exception:
+                logger.exception("Error reading Ogg Opus tags")
 
         # Fallback: inspect common tags
         if not artist or not title:
@@ -292,8 +303,8 @@ def embed_lyrics_in_file(file_path, lyrics_text, lyrics_type="plain"):
                 logger.exception("Verification exception for FLAC")
                 return False
 
-        # OGG/Opus
-        elif isinstance(audio, OggVorbis) or file_path.lower().endswith(('.ogg', '.opus')):
+        # Ogg Vorbis
+        elif isinstance(audio, OggVorbis) or file_path.lower().endswith('.ogg'):
             try:
                 og = OggVorbis(file_path)
                 if lyrics_type == 'plain':
@@ -302,22 +313,50 @@ def embed_lyrics_in_file(file_path, lyrics_text, lyrics_type="plain"):
                     og['SYNCEDLYRICS'] = [lyrics_text]
                 og.save()
             except Exception:
-                logger.exception("Failed to write Ogg tags")
+                logger.exception("Failed to write Ogg Vorbis tags")
                 return False
 
             # verify
             try:
                 og_check = OggVorbis(file_path)
                 if lyrics_type == 'plain' and og_check.get('LYRICS'):
-                    logger.debug("OGG LYRICS present after save")
+                    logger.debug("OGG VORBIS LYRICS present after save")
                     return True
                 if lyrics_type == 'synced' and og_check.get('SYNCEDLYRICS'):
-                    logger.debug("OGG SYNCEDLYRICS present after save")
+                    logger.debug("OGG VORBIS SYNCEDLYRICS present after save")
                     return True
-                logger.error("Verification failed for OGG")
+                logger.error("Verification failed for OGG Vorbis")
                 return False
             except Exception:
-                logger.exception("Verification exception for OGG")
+                logger.exception("Verification exception for OGG Vorbis")
+                return False
+
+        # Ogg Opus
+        elif isinstance(audio, OggOpus) or file_path.lower().endswith('.opus'):
+            try:
+                og = OggOpus(file_path)
+                if lyrics_type == 'plain':
+                    og['LYRICS'] = [lyrics_text]
+                else:
+                    og['SYNCEDLYRICS'] = [lyrics_text]
+                og.save()
+            except Exception:
+                logger.exception("Failed to write Ogg Opus tags")
+                return False
+
+            # verify
+            try:
+                og_check = OggOpus(file_path)
+                if lyrics_type == 'plain' and og_check.get('LYRICS'):
+                    logger.debug("OGG OPUS LYRICS present after save")
+                    return True
+                if lyrics_type == 'synced' and og_check.get('SYNCEDLYRICS'):
+                    logger.debug("OGG OPUS SYNCEDLYRICS present after save")
+                    return True
+                logger.error("Verification failed for OGG Opus")
+                return False
+            except Exception:
+                logger.exception("Verification exception for OGG Opus")
                 return False
 
         else:
