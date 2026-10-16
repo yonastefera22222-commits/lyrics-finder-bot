@@ -17,7 +17,12 @@ from pathlib import Path
 import tempfile
 from rapidfuzz import fuzz
 
+import metadata_handler
 from metadata_handler import read_id3v2_metadata, embed_lyrics_in_file
+
+# Shown in the startup log and by /diag: makes it obvious which code a deploy
+# is really running.
+CODE_VERSION = "1.3"
 
 # Load environment variables from .env if present
 try:
@@ -73,6 +78,43 @@ AUDIO_MIME_TO_EXT = {
     'audio/aiff': '.aiff', 'audio/x-aiff': '.aiff',
 }
 SUPPORTED_LIST = "MP3, M4A/MP4, M4B, FLAC, WAV, AIFF, OGG/OPUS"
+
+# --- LRCLIB CONFIG ---
+# lrclib sits behind Cloudflare: the default python-requests User-Agent is
+# often answered with 403/429, and a single network hiccup used to make the bot
+# answer "Error fetching lyrics" while the very same call works a second later.
+LRCLIB_HEADERS = {
+    'User-Agent': os.environ.get('LRCLIB_UA', 'LyricsFinderBot/1.1 (+https://lrclib.net)'),
+    'Accept': 'application/json',
+}
+LRCLIB_RETRIES = 3
+
+def lrclib_get(url, params=None, timeout=10):
+    """GET a lrclib endpoint with a real User-Agent plus a small retry loop.
+
+    Returns the decoded JSON (list/dict) or None. A 400/404 means the request
+    itself is wrong (unknown track id, no match) so it is not retried.
+    """
+    last_error = "unknown"
+    for attempt in range(LRCLIB_RETRIES):
+        try:
+            res = requests.get(url, params=params, headers=LRCLIB_HEADERS, timeout=timeout)
+            if res.status_code == 200:
+                try:
+                    return res.json()
+                except Exception:
+                    last_error = "invalid JSON"
+            else:
+                last_error = f"HTTP {res.status_code}"
+                if res.status_code in (400, 404):
+                    print(f"[DEBUG] lrclib {url} -> {last_error} (no retry)")
+                    return None
+        except Exception as e:
+            last_error = str(e)
+        if attempt < LRCLIB_RETRIES - 1:
+            time.sleep(0.6 * (attempt + 1))
+    print(f"[ERROR] lrclib request failed: {url} ({last_error})")
+    return None
 
 def normalize_str(s):
     if not s:
@@ -159,24 +201,16 @@ def find_lrclib_match_for_itunes(artist, title):
         title = title or ""
 
         # Query 1: artist + title
-        query_full = f"{artist} {title}".strip()
-        results = []
-        try:
-            q_enc = requests.utils.quote(query_full)[:200]
-            res = requests.get(f"https://lrclib.net/api/search?q={q_enc}", timeout=6)
-            if res.status_code == 200:
-                results = res.json() or []
-        except Exception:
+        results = lrclib_get("https://lrclib.net/api/search",
+                             params={'q': f"{artist} {title}".strip()[:200]}, timeout=6)
+        if not isinstance(results, list):
             results = []
 
         # Fallback: title only
         if not results:
-            try:
-                q_title_enc = requests.utils.quote(title)[:200]
-                res2 = requests.get(f"https://lrclib.net/api/search?q={q_title_enc}", timeout=6)
-                if res2.status_code == 200:
-                    results = res2.json() or []
-            except Exception:
+            results = lrclib_get("https://lrclib.net/api/search",
+                                 params={'q': title[:200]}, timeout=6)
+            if not isinstance(results, list):
                 results = []
 
         if not results:
@@ -451,22 +485,15 @@ def search_lyrics_by_metadata(artist, title, duration=None):
         query = f"{artist} {title}".strip()
         print(f"[DEBUG] Searching for lyrics with query: {query}")
 
-        results = []
-        try:
-            q = requests.utils.quote(query[:100])
-            res = requests.get(f"https://lrclib.net/api/search?q={q}", timeout=10)
-            if res.status_code == 200:
-                results = res.json() or []
-        except Exception:
+        results = lrclib_get("https://lrclib.net/api/search",
+                             params={'q': query[:100]}, timeout=10)
+        if not isinstance(results, list):
             results = []
 
         if not results and title:
-            try:
-                q = requests.utils.quote(title[:100])
-                res = requests.get(f"https://lrclib.net/api/search?q={q}", timeout=10)
-                if res.status_code == 200:
-                    results = res.json() or []
-            except Exception:
+            results = lrclib_get("https://lrclib.net/api/search",
+                                 params={'q': title[:100]}, timeout=10)
+            if not isinstance(results, list):
                 results = []
 
         if not results:
@@ -495,8 +522,13 @@ def search_lyrics_by_metadata(artist, title, duration=None):
         traceback.print_exc()
         return None
 
-def get_lyrics_by_track_id(track_id):
-    """Fetch lyrics with caching"""
+def get_lyrics_by_track_id(track_id, artist=None, title=None):
+    """Fetch lyrics with caching.
+
+    lrclib's /api/get/<id> can fail (old id, rate limit, Cloudflare hiccup), so
+    when artist/title are known we simply ask lrclib again and use whatever it
+    gives us - instead of showing "Error fetching lyrics".
+    """
     if not track_id:
         print("[ERROR] Track ID is empty")
         return None
@@ -506,25 +538,30 @@ def get_lyrics_by_track_id(track_id):
         print(f"[DEBUG] Using cached lyrics for track {track_id}")
         return cached
 
-    try:
-        print(f"[DEBUG] Fetching lyrics for track {track_id}")
-        res = requests.get(
-            f"https://lrclib.net/api/get/{track_id}",
-            timeout=10
-        )
-        data = res.json()
-        if data and 'id' in data:
-            lyrics_cache.set(track_id, data)
-            print(f"[DEBUG] Successfully fetched lyrics for track {track_id}")
-            return data
-        else:
-            print(f"[ERROR] Invalid response for track {track_id}")
-            return None
-    except Exception as e:
-        print(f"[ERROR] Fetch error: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+    print(f"[DEBUG] Fetching lyrics for track {track_id}")
+    data = lrclib_get(f"https://lrclib.net/api/get/{requests.utils.quote(str(track_id))}")
+
+    if not (isinstance(data, dict) and data.get('id')) and title:
+        print(f"[DEBUG] Track id lookup failed, searching lrclib by title: {title}")
+        fallback = search_lyrics_by_metadata(artist or '', title) or None
+        if fallback:
+            fb_id = fallback.get('id')
+            if fb_id:
+                data = lrclib_get(f"https://lrclib.net/api/get/{requests.utils.quote(str(fb_id))}")
+            # the search record itself may already carry the lyrics
+            if not (isinstance(data, dict) and data.get('id')):
+                data = fallback
+
+    if isinstance(data, dict) and data.get('id'):
+        real_id = data.get('id')
+        lyrics_cache.set(track_id, data)
+        if str(real_id) != str(track_id):
+            lyrics_cache.set(real_id, data)
+        print(f"[DEBUG] Successfully fetched lyrics for track {track_id}")
+        return data
+
+    print(f"[ERROR] Could not load lyrics for track {track_id}")
+    return None
 
 def do_search(message, query):
     """
@@ -580,10 +617,9 @@ def do_search(message, query):
             return
 
         # 2) Fallback: original lrclib search and ranking if no iTunes matches
-        res = requests.get(f"https://lrclib.net/api/search?q={requests.utils.quote(query[:80])}", timeout=10)
-        try:
-            results = res.json() if isinstance(res.json(), list) else []
-        except Exception:
+        results = lrclib_get("https://lrclib.net/api/search",
+                             params={'q': query[:80]}, timeout=10)
+        if not isinstance(results, list):
             results = []
 
         # Rank results by fuzzy match against the query (title + artist)
@@ -661,7 +697,7 @@ def help_cmd(message):
         "🔹 *DM:* Type song name\n"
         "🔹 *Groups:* /lyrics songname\n"
         "🔹 *Send MP3:* I'll lyricize it!\n\n"
-        "/random /trending /top /stats",
+        "/random /trending /top /stats /diag",
         reply_markup=get_menu_markup(message.from_user.id),
         parse_mode='Markdown'
     )
@@ -714,8 +750,10 @@ def random_song(message):
     query = random.choice(RANDOM_QUERIES)
     status = bot.reply_to(message, f"🎲 Fetching *{query}*...", parse_mode='Markdown')
     try:
-        res = requests.get(f"https://lrclib.net/api/search?q={query}", timeout=10)
-        results = res.json()[:6]
+        results = lrclib_get("https://lrclib.net/api/search", params={'q': query}, timeout=10)
+        if not isinstance(results, list):
+            results = []
+        results = results[:6]
         if not results:
             bot.edit_message_text("No results.", message.chat.id, status.message_id)
             return
@@ -763,6 +801,36 @@ def lyrics_cmd(message):
         bot.reply_to(message, "Usage: `/lyrics songname`", parse_mode='Markdown')
         return
     do_search(message, parts[1].strip()[:100])
+
+@bot.message_handler(commands=['diag'])
+def diag_cmd(message):
+    """Self-test: shows the deployed code versions and checks embedding."""
+    save_chat(message.chat)
+    if not admin_db.is_admin(message.from_user.id):
+        bot.reply_to(message, "⛔ Admin only.")
+        return
+
+    lines = [
+        "🩺 *Diagnostics*",
+        "",
+        f"main.py: {CODE_VERSION}",
+        f"metadata_handler.py: {getattr(metadata_handler, 'CODE_VERSION', 'OLD')}",
+        f"admin_db.py: {getattr(admin_db, 'CODE_VERSION', 'OLD')}",
+        f"python: {sys.version.split()[0]}",
+        "",
+    ]
+    try:
+        results = metadata_handler.self_test()
+        for fmt, ok in results:
+            lines.append(f"{'✅' if ok else '❌'} {fmt} embed test")
+        if not all(ok for _, ok in results):
+            lines.append("")
+            lines.append(f"reason: {metadata_handler.LAST_ERROR}")
+    except Exception as e:
+        lines.append(f"❌ self test crashed: {type(e).__name__}: {e}")
+
+    bot.reply_to(message, "\n".join(lines))
+    gc.collect()
 
 @bot.message_handler(commands=['addadmin'])
 def addadmin_cmd(message):
@@ -980,6 +1048,41 @@ def find_track_for_metadata(metadata, original_name):
             return track
     return None
 
+def save_tracking(file_name, file_path, track_id, file_id=None, user_id=None,
+                  original_name=None, artist=None, title=None):
+    """Save tracking info, tolerating an older admin_db.py during upgrades."""
+    try:
+        admin_db.save_file_tracking(
+            file_name, file_path, track_id, file_id=file_id, user_id=user_id,
+            original_name=original_name, artist=artist, title=title)
+        return
+    except TypeError:
+        print("[WARN] admin_db.py is older than main.py - saving without extra fields")
+    except Exception as e:
+        print(f"[ERROR] Save file tracking failed: {e}")
+        return
+    try:
+        admin_db.save_file_tracking(file_name, file_path, track_id)
+    except Exception as e:
+        print(f"[ERROR] Save file tracking failed: {e}")
+
+def lookup_tracking(file_name=None, track_id=None):
+    """Find a tracking row by file name (preferred) or by lyrics track id."""
+    try:
+        if file_name and hasattr(admin_db, 'get_file_tracking'):
+            row = admin_db.get_file_tracking(file_name)
+            if row:
+                row['file_name'] = file_name
+                return row
+    except Exception as e:
+        print(f"[ERROR] Tracking lookup by file failed: {e}")
+    try:
+        if track_id and hasattr(admin_db, 'get_tracking_by_track_id'):
+            return admin_db.get_tracking_by_track_id(track_id)
+    except Exception as e:
+        print(f"[ERROR] Tracking lookup by track failed: {e}")
+    return None
+
 def rehydrate_tracked_file(entry):
     """Return a usable local path, re-downloading from Telegram if needed.
 
@@ -1165,6 +1268,8 @@ def handle_music_file(message):
 
         print(f"[DEBUG] Track found: {track.get('artistName')} - {track.get('trackName')} (id={track.get('id')})")
         track_id = track.get('id')
+        track_artist = (track.get('artistName') or '').strip()
+        track_title = (track.get('trackName') or '').strip()
         if not track_id:
             print("[ERROR] Track has no ID")
             bot.edit_message_text("❌ Invalid track data.", message.chat.id, progress_msg.message_id)
@@ -1174,7 +1279,7 @@ def handle_music_file(message):
                 pass
             return
 
-        lyrics_data = get_lyrics_by_track_id(track_id)
+        lyrics_data = get_lyrics_by_track_id(track_id, track_artist, track_title)
 
         if not lyrics_data:
             print("[ERROR] Could not fetch lyrics data")
@@ -1203,10 +1308,12 @@ def handle_music_file(message):
         except Exception:
             pass
 
-        # track the upload (keeps file_id so it can be re-downloaded later)
-        admin_db.save_file_tracking(
+        # track the upload (keeps file_id so it can be re-downloaded later and
+        # artist/title so lyrics can be re-searched if the track id fails)
+        save_tracking(
             file_name, file_path, track_id,
-            file_id=media.file_id, user_id=user_id, original_name=original_name
+            file_id=media.file_id, user_id=user_id, original_name=original_name,
+            artist=track_artist, title=track_title
         )
 
         info_text = (
@@ -1243,10 +1350,16 @@ def view_lyrics_callback(call):
     save_chat(call.message.chat)
     track_id = call.data.split('_')[2]
 
-    lyrics_data = get_lyrics_by_track_id(track_id)
+    row = lookup_tracking(track_id=track_id) or {}
+    lyrics_data = get_lyrics_by_track_id(track_id, row.get('artist'), row.get('title'))
 
     if not lyrics_data:
-        bot.answer_callback_query(call.id, "Error fetching.")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔄 Try again", callback_data=call.data))
+        bot.answer_callback_query(call.id, "Lyrics service busy - try again")
+        bot.send_message(call.message.chat.id,
+                         "⚠️ Could not load the lyrics just now.\nTap below to try again.",
+                         reply_markup=markup)
         return
 
     info = f"🎵 *{lyrics_data.get('artistName', 'Unknown')[:30]}*\n📝 {lyrics_data.get('trackName', 'Unknown')[:30]}"
@@ -1281,9 +1394,15 @@ def prepare_embed_callback(call):
 
     bot.answer_callback_query(call.id)
 
-    lyrics_data = get_lyrics_by_track_id(track_id)
+    row = lookup_tracking(file_name=file_name, track_id=track_id) or {}
+    lyrics_data = get_lyrics_by_track_id(track_id, row.get('artist'), row.get('title'))
     if not lyrics_data:
-        bot.send_message(call.message.chat.id, "❌ Error fetching lyrics. Please try again.")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔄 Try again", callback_data=call.data))
+        bot.send_message(call.message.chat.id,
+                         "⚠️ Could not reach the lyrics service just now.\n"
+                         "This is usually a 1-second hiccup - tap below to try again.",
+                         reply_markup=markup)
         return
 
     has_synced = bool(lyrics_data.get('syncedLyrics'))
@@ -1323,7 +1442,7 @@ def do_embed_callback(call):
 
     try:
         # Look the upload up; on Render the local copy may already be gone
-        entry = admin_db.get_file_tracking(file_name)
+        entry = lookup_tracking(file_name=file_name)
         if not entry:
             bot.edit_message_text("❌ File tracking not found. Please send the song again.",
                                   call.message.chat.id, msg.message_id)
@@ -1339,9 +1458,12 @@ def do_embed_callback(call):
                 call.message.chat.id, msg.message_id)
             return
 
-        lyrics_data = get_lyrics_by_track_id(track_id)
+        lyrics_data = get_lyrics_by_track_id(track_id, entry.get('artist'), entry.get('title'))
         if not lyrics_data:
-            bot.edit_message_text("❌ Cannot fetch lyrics for this track.", call.message.chat.id, msg.message_id)
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔄 Try again", callback_data=call.data))
+            bot.edit_message_text("⚠️ Could not load the lyrics just now. Tap below to try again.",
+                                  call.message.chat.id, msg.message_id, reply_markup=markup)
             return
 
         lyrics_content = lyrics_data.get('syncedLyrics') if lyrics_type == "synced" else lyrics_data.get('plainLyrics')
@@ -1366,9 +1488,13 @@ def do_embed_callback(call):
                 pass
 
         if not success:
+            reason = getattr(metadata_handler, 'LAST_ERROR', None) or "unknown"
+            print(f"[ERROR] Embed failed ({file_name}): {reason}")
             bot.edit_message_text(
                 f"❌ Could not add lyrics to this file.\n"
-                f"Supported formats: {SUPPORTED_LIST}.",
+                f"Supported formats: {SUPPORTED_LIST}.\n\n"
+                f"reason: {str(reason)[:120]}\n"
+                f"(send /diag for a self test)",
                 call.message.chat.id, msg.message_id)
             return
 
@@ -1411,8 +1537,10 @@ def handle_trending_pick(call):
     query = call.data[len('trend_'):][:50]
     stats['searches'] += 1
     try:
-        res = requests.get(f"https://lrclib.net/api/search?q={query}", timeout=10)
-        results = res.json()[:6]
+        results = lrclib_get("https://lrclib.net/api/search", params={'q': query}, timeout=10)
+        if not isinstance(results, list):
+            results = []
+        results = results[:6]
 
         if not results:
             bot.answer_callback_query(call.id, "No results.")
@@ -1529,8 +1657,10 @@ def random_callback(call):
     stats['random_used'] += 1
     query = random.choice(RANDOM_QUERIES)
     try:
-        res = requests.get(f"https://lrclib.net/api/search?q={query}", timeout=10)
-        results = res.json()[:6]
+        results = lrclib_get("https://lrclib.net/api/search", params={'q': query}, timeout=10)
+        if not isinstance(results, list):
+            results = []
+        results = results[:6]
         if not results:
             bot.answer_callback_query(call.id, "Error.")
             return
@@ -1591,6 +1721,9 @@ signal.signal(signal.SIGTERM, signal_handler)
 # --- START BOT ---
 if __name__ == "__main__":
     print("[INFO] Starting Lyrics Finder Bot...")
+    print(f"[INFO] Versions -> main.py {CODE_VERSION} | "
+          f"metadata_handler.py {getattr(metadata_handler, 'CODE_VERSION', 'OLD')} | "
+          f"admin_db.py {getattr(admin_db, 'CODE_VERSION', 'OLD')}")
     bot_thread = Thread(target=start_bot, daemon=True)
     bot_thread.daemon = True
     bot_thread.start()
