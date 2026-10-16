@@ -19,6 +19,13 @@ from rapidfuzz import fuzz
 
 from metadata_handler import read_id3v2_metadata, embed_lyrics_in_file
 
+# Load environment variables from .env if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 # --- OWNER ID (set your Telegram user ID here) ---
 OWNER_ID = 951232574  # <<<<<<------- OWNER ID SET HERE
 
@@ -229,18 +236,35 @@ def home():
 
 def start_bot():
     """Start bot with skip_pending to prevent conflict with other instances"""
-    try:
-        bot.infinity_polling(skip_pending=True, timeout=30)
-    except KeyboardInterrupt:
-        print("[INFO] Bot interrupted")
-    except Exception as e:
-        print(f"[ERROR] Bot error: {e}")
-        sys.exit(1)
+    while True:
+        try:
+            # Remove any previously set webhook so long-polling can receive updates
+            try:
+                bot.delete_webhook(drop_pending_updates=True, timeout=15)
+                print("[INFO] Webhook cleared; switching to long polling.")
+            except Exception as e:
+                print(f"[WARN] Could not clear webhook: {e}")
+            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+            break
+        except KeyboardInterrupt:
+            print("[INFO] Bot interrupted")
+            break
+        except Exception as e:
+            print(f"[ERROR] Bot error: {e}")
+            import traceback
+            traceback.print_exc()
+            time.sleep(5)
+            continue
 
 # --- CONFIGURATION ---
-API_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+API_TOKEN = (
+    os.environ.get('TELEGRAM_BOT_TOKEN')
+    or os.environ.get('BOT_TOKEN')
+    or os.environ.get('TELEGRAM_TOKEN')
+    or os.environ.get('API_TOKEN')
+)
 if not API_TOKEN:
-    raise ValueError("Missing TELEGRAM_BOT_TOKEN environment variable")
+    raise ValueError("Missing TELEGRAM_BOT_TOKEN (or BOT_TOKEN/TELEGRAM_TOKEN) environment variable")
 
 bot = telebot.TeleBot(API_TOKEN, threaded=True, skip_pending=True)
 
@@ -833,7 +857,10 @@ def dm_search(message):
         markup.add(types.InlineKeyboardButton("Start", url=f"https://t.me/{bot_username}?start=true"))
         bot.reply_to(message, "⛔ Access Denied.", reply_markup=markup, parse_mode='Markdown')
         return
-    do_search(message, message.text[:100])
+    query = (message.text or "").strip()
+    if not query:
+        return
+    do_search(message, query[:100])
 
 # --- MUSIC FILE HANDLER ---
 @bot.message_handler(content_types=['audio', 'document'])
