@@ -2050,7 +2050,7 @@ if __name__ == "__main__":
     print(f"[INFO] Versions -> main.py {CODE_VERSION} | "
           f"metadata_handler.py {getattr(metadata_handler, 'CODE_VERSION', 'OLD')} | "
           f"admin_db.py {getattr(admin_db, 'CODE_VERSION', 'OLD')}")
-        import sys
+    import sys
     sys.modules['main'] = sys.modules['__main__']
     try:
         import search_fix
