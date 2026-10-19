@@ -22,7 +22,7 @@ from metadata_handler import read_id3v2_metadata, embed_lyrics_in_file
 
 # Shown in the startup log and by /diag: makes it obvious which code a deploy
 # is really running.
-CODE_VERSION = "1.3"
+CODE_VERSION = "1.4"
 
 # Load environment variables from .env if present
 try:
@@ -88,6 +88,19 @@ LRCLIB_HEADERS = {
     'Accept': 'application/json',
 }
 LRCLIB_RETRIES = 3
+
+# --- ACCESS + GROUP BEHAVIOUR -------------------------------------------------
+# By default *anyone* can search. Put RESTRICT_TO_ADMINS=1 in your Render
+# environment variables to go back to admins-only.
+RESTRICT_TO_ADMINS = os.environ.get('RESTRICT_TO_ADMINS', '0') == '1'
+# Telegram's privacy mode (on by default) hides normal group messages from the
+# bot. Once you turn it OFF in @BotFather (and re-add the bot), set
+# GROUP_PLAIN_TEXT=1 so the bot answers every message in the group.
+GROUP_PLAIN_TEXT = os.environ.get('GROUP_PLAIN_TEXT', '0') == '1'
+
+# Our own Telegram user id, filled in on the first reply we need it for.
+BOT_ID = None
+
 
 def lrclib_get(url, params=None, timeout=10):
     """GET a lrclib endpoint with a real User-Agent plus a small retry loop.
@@ -233,6 +246,291 @@ def find_lrclib_match_for_itunes(artist, title):
     except Exception as e:
         print(f"[DEBUG] find_lrclib_match_for_itunes error: {e}")
         return None
+
+# --- SMART TEXT SEARCH -------------------------------------------------------
+# Every lrclib row we have already seen: "<id>" -> row. lrclib's /api/search
+# already returns the lyrics, so remembering the rows means tapping a result
+# needs zero extra network calls (that used to end in "Error fetching lyrics").
+track_cache = {}
+TRACK_CACHE_MAX = 300
+
+# normalised query -> (timestamp, ranked rows). Keeps repeat searches instant.
+search_cache = {}
+SEARCH_CACHE_TTL = 300
+
+# chat id -> last result list, so "back" can bring the list up again
+last_results = {}
+
+
+def clean_query_text(raw):
+    """Tidy up what a human typed, without destroying the song name."""
+    text = (raw or "").strip()
+    text = re.sub(r"https?://\S+", " ", text)
+    text = text.strip(" \t\r\n\"'`")
+    text = re.sub(r"^\s*(?:song|track|lyrics?)\s*(?:of|for|to)?\s+", "", text, flags=re.I)
+    text = re.sub(r"\s+lyrics?\s*$", "", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def strip_noise(text):
+    """Drop brackets, 'feat. ...' tails and quality words like 'official hd'."""
+    t = (text or "").replace("_", " ")
+    t = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", t)
+    t = re.sub(r"\b(?:ft|feat|featuring)\b\.?.*$", " ", t, flags=re.I)
+    t = re.sub(r"\b(?:official|audio|video|hd|hq|4k|mv|music video|visuali[sz]er|lyrics?|remaster(?:ed)?)\b",
+               " ", t, flags=re.I)
+    t = re.sub(r"[^\w\s&'\-]", " ", t)
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
+
+
+def split_artist_title(text):
+    """'Artist - Title', 'Artist: Title', 'Title by Artist' -> (artist, title).
+
+    Returns ("", whole text) when the query is only a song name.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return "", ""
+
+    # split first (before punctuation is removed) so "Eminem: Lose Yourself"
+    # and "Adele - Hello" both work
+    parts = re.split(r"\s*[-\u2013\u2014:|]\s+", raw, maxsplit=1)
+    if len(parts) == 2:
+        artist, title = strip_noise(parts[0]), strip_noise(parts[1])
+        if artist and title:
+            return artist, title
+
+    flat = strip_noise(raw)
+    m = re.match(r"^(.*?)\s+by\s+(.*)$", flat, flags=re.I)
+    if m and m.group(1).strip() and m.group(2).strip():
+        return m.group(2).strip(), m.group(1).strip()
+    return "", flat
+
+
+def lrclib_exact(artist, title):
+    """lrclib's /api/get lookup - the most precise (and cheapest) search."""
+    if not title:
+        return None
+    params = {'track_name': title[:120]}
+    if artist:
+        params['artist_name'] = artist[:120]
+    row = lrclib_get("https://lrclib.net/api/get", params=params, timeout=8)
+    return row if isinstance(row, dict) and row.get('id') else None
+
+
+def remember_tracks(rows):
+    """Keep the rows we have seen so 'view lyrics' never needs a new request."""
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        tid = row.get('id')
+        if tid is not None:
+            track_cache[str(tid)] = row
+    while len(track_cache) > TRACK_CACHE_MAX:
+        try:
+            track_cache.pop(next(iter(track_cache)))
+        except StopIteration:
+            break
+
+
+def rank_tracks(query_artist, query_title, rows):
+    """Score, de-duplicate and sort lrclib rows for one query."""
+    scored = []
+    seen = set()
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        artist = (row.get('artistName') or '').strip()
+        title = (row.get('trackName') or '').strip()
+        if not title:
+            continue
+        key = (normalize_str(artist), normalize_str(title))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        score = score_track_match(query_artist, query_title, artist, title)
+        if not query_artist:
+            # the query was one string: it may be the title, or "artist title"
+            score = max(score,
+                        score_track_match('', query_title, artist, title),
+                        score_track_match(artist, query_title, artist, title) * 0.9)
+
+        # prefer versions that actually have lyrics, avoid instrumental floods
+        if row.get('syncedLyrics'):
+            score += 6
+        elif row.get('plainLyrics'):
+            score += 3
+        if re.search(r"\b(instrumental|karaoke|tribute|8d audio|lullaby)\b", title, re.I):
+            score -= 12
+
+        scored.append((score, row))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored
+
+
+def search_tracks(query, limit=8):
+    """Ranked, de-duplicated lrclib results for a free-text query.
+
+    Fast path first, and it stops as soon as there is enough to show:
+      1. lrclib /api/get  - exact artist + title lookup (1 request)
+      2. lrclib /api/search with the cleaned query, then the title alone
+      3. iTunes only as a spelling/artist corrector when we are still short
+    """
+    cleaned = clean_query_text(query)
+    if not cleaned:
+        return []
+
+    cache_key = normalize_str(cleaned)
+    hit = search_cache.get(cache_key)
+    if hit and (time.time() - hit[0]) < SEARCH_CACHE_TTL:
+        return hit[1][:limit]
+
+    q_artist, q_title = split_artist_title(cleaned)
+    rows = []
+
+    # 1) precise lookup
+    exact = lrclib_exact(q_artist, q_title)
+    if exact:
+        rows.append(exact)
+
+    # 2) ordinary searches - at most two, and only while we still need more
+    queries = []
+    for candidate in (cleaned, q_title, " ".join(cleaned.split()[:4])):
+        candidate = (candidate or "").strip()
+        if candidate and candidate not in queries:
+            queries.append(candidate)
+    for candidate in queries[:2]:
+        found = lrclib_get("https://lrclib.net/api/search",
+                           params={'q': candidate[:120]}, timeout=8)
+        if isinstance(found, list):
+            rows.extend(found)
+        if len(rows) >= limit * 3:
+            break
+
+    ranked = rank_tracks(q_artist, q_title, rows)
+
+    # 3) iTunes as a last-resort corrector for sloppy spelling
+    if len(ranked) < 3:
+        for item in (get_itunes_results(cleaned, limit=4) or [])[:3]:
+            row = find_lrclib_match_for_itunes(item.get('artistName') or '',
+                                               item.get('trackName') or '')
+            if row:
+                rows.append(row)
+        ranked = rank_tracks(q_artist, q_title, rows)
+
+    remember_tracks([row for _, row in ranked])
+    result = ranked[:max(limit, 8)]
+    try:
+        search_cache[cache_key] = (time.time(), result)
+        if len(search_cache) > 60:
+            search_cache.pop(next(iter(search_cache)), None)
+    except Exception:
+        pass
+    return result[:limit]
+
+
+# --- RESULT RENDERING --------------------------------------------------------
+def md_escape(text):
+    """Make dynamic text safe for Telegram's legacy Markdown mode."""
+    return "".join("\\" + ch if ch in "_*`[" else ch for ch in str(text or ""))
+
+
+def track_button_label(track):
+    artist = (track.get('artistName') or 'Unknown').strip()[:20]
+    title = (track.get('trackName') or 'Unknown').strip()[:26]
+    label = f"{artist} — {title}"
+    album = (track.get('albumName') or '').strip()
+    if album:
+        label += f" · {album[:14]}"
+    seconds = track.get('duration') or 0
+    if seconds:
+        label += f" · {seconds // 60}:{seconds % 60:02d}"
+    return label
+
+
+def build_track_options(track):
+    """Text + buttons for one track (no Markdown, so odd titles cannot break it)."""
+    tid = track.get('id')
+    artist = (track.get('artistName') or 'Unknown').strip()
+    title = (track.get('trackName') or 'Unknown').strip()
+    album = (track.get('albumName') or '').strip()
+    duration = track.get('duration') or 0
+    dur_str = f"{duration // 60}:{duration % 60:02d}" if duration else ""
+
+    text = f"🎵 {artist[:40]}\n📝 {title[:40]}"
+    if album:
+        text += f"\n💿 {album[:40]}"
+    if dur_str:
+        text += f"\n⏱ {dur_str}"
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    if track.get('syncedLyrics'):
+        markup.add(
+            types.InlineKeyboardButton("🎼 Synced → Text", callback_data=f"st_{tid}"),
+            types.InlineKeyboardButton("🎼 Synced → .lrc", callback_data=f"sf_{tid}"),
+        )
+    if track.get('plainLyrics'):
+        markup.add(
+            types.InlineKeyboardButton("📄 Plain → Text", callback_data=f"pt_{tid}"),
+            types.InlineKeyboardButton("📄 Plain → .txt", callback_data=f"pf_{tid}"),
+        )
+    markup.add(types.InlineKeyboardButton("⬅️ Back to results", callback_data="back"))
+    return text, markup
+
+
+def results_text(ranked, query=""):
+    n = len(ranked)
+    if query:
+        return f"🎧 {n} result{'s' if n != 1 else ''} for “{str(query)[:40]}” — pick one:"
+    return f"🎧 {n} version{'s' if n != 1 else ''} — pick one:"
+
+
+def results_markup(ranked):
+    markup = types.InlineKeyboardMarkup()
+    for _, track in ranked:
+        markup.add(types.InlineKeyboardButton(track_button_label(track),
+                                              callback_data=f"sel_{track.get('id')}"))
+    return markup
+
+
+def remember_results(chat_id, ranked):
+    try:
+        last_results[str(chat_id)] = ranked[:8]
+        if len(last_results) > 200:
+            last_results.pop(next(iter(last_results)), None)
+    except Exception:
+        pass
+
+
+def send_long_text(chat_id, text, reply_to=None):
+    """Send long lyrics as a few normal messages instead of failing."""
+    text = (text or "").strip()
+    if not text:
+        return False
+    limit = 3500
+    if len(text) <= limit:
+        bot.send_message(chat_id, text, reply_to_message_id=reply_to)
+        return True
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+    for i, chunk in enumerate(chunks[:4]):
+        bot.send_message(chat_id, chunk.strip(),
+                         reply_to_message_id=reply_to if i == 0 else None)
+    if len(chunks) > 4:
+        bot.send_message(chat_id, "…truncated. Use the file button for the full lyrics.")
+    return True
+
 
 def cleanup_old_files(max_age_hours=FILE_EXPIRY_HOURS):
     """Clean up old persistent files"""
@@ -400,7 +698,7 @@ TRENDING_POOL = [
     "euphoria kendrick lamar", "squabble up kendrick lamar",
     "timeless the weeknd playboi carti", "sinner pray for me the weeknd",
     "luther kendrick lamar sza", "tv off kendrick lamar"
-]
+    ]
 
 def escape_markdown_v2(text):
     chars = r"_*[]()~`>#+-=|{}.!<>"
@@ -485,34 +783,13 @@ def search_lyrics_by_metadata(artist, title, duration=None):
         query = f"{artist} {title}".strip()
         print(f"[DEBUG] Searching for lyrics with query: {query}")
 
-        results = lrclib_get("https://lrclib.net/api/search",
-                             params={'q': query[:100]}, timeout=10)
-        if not isinstance(results, list):
-            results = []
-
-        if not results and title:
-            results = lrclib_get("https://lrclib.net/api/search",
-                                 params={'q': title[:100]}, timeout=10)
-            if not isinstance(results, list):
-                results = []
-
-        if not results:
+        ranked = search_tracks(query, limit=3)
+        if not ranked:
             return None
 
-        ranked = []
-        for track in results:
-            track_artist = track.get("artistName", "")
-            track_title = track.get("trackName", "")
-            score = score_track_match(artist, title, track_artist, track_title)
-            if score >= 55:
-                ranked.append((score, track))
-
-        if not ranked:
-            print(f"[DEBUG] No strong match found; falling back to first result")
-            return results[0]
-
-        ranked.sort(key=lambda x: x[0], reverse=True)
-        best = ranked[0][1]
+        best_score, best = ranked[0]
+        if best_score < 55:
+            print(f"[DEBUG] No strong match (best {best_score:.0f}); using top result anyway")
         print(f"[DEBUG] Best match: {best.get('artistName')} - {best.get('trackName')}")
         return best
 
@@ -532,6 +809,13 @@ def get_lyrics_by_track_id(track_id, artist=None, title=None):
     if not track_id:
         print("[ERROR] Track ID is empty")
         return None
+
+    # lrclib's /api/search already hands us the lyrics, so a remembered row
+    # answers the request instantly (and never shows "Error fetching lyrics").
+    remembered = track_cache.get(str(track_id))
+    if remembered and (remembered.get('plainLyrics') or remembered.get('syncedLyrics')):
+        print(f"[DEBUG] Serving lyrics for track {track_id} from the search result")
+        return remembered
 
     cached = lyrics_cache.get(track_id)
     if cached:
@@ -564,116 +848,81 @@ def get_lyrics_by_track_id(track_id, artist=None, title=None):
     return None
 
 def do_search(message, query):
-    """
-    Primary search flow (iTunes-first):
-    - Query iTunes for popular songs by the query term.
-    - For each iTunes result (in order), try to find a matching lrclib track by artist+title.
-    - Present the matched lrclib tracks in iTunes order (replying to the user's message).
-    - Fallback to lrclib search if no iTunes→lrclib matches found.
+    """Search for a song by free text and show the matches.
+
+    Fast + forgiving: it cleans the query, asks lrclib directly (exact lookup
+    first), ranks the answers, and only falls back to iTunes when the direct
+    lookup comes up short. No Markdown is used on dynamic text, so a song title
+    full of _ * [ ] can no longer crash the reply.
     """
     save_chat(message.chat)
     stats['searches'] += 1
-    requester = get_requester(message)
-    query_key = query.lower()[:50]
+    query_key = (query or "").lower()[:50]
     search_counts[query_key] = search_counts.get(query_key, 0) + 1
+    chat_id = message.chat.id
 
-    # Post a temporary "Searching..." reply so we can reply-to the original message later
-    status = bot.reply_to(message, f"🔍 Searching for *{query[:40]}*...", parse_mode='Markdown')
+    status = None
     try:
-        # 1) Query iTunes first
-        itunes_items = get_itunes_results(query, limit=ITUNES_LIMIT)
-        matched_tracks = []
-        seen_ids = set()
-        if itunes_items:
-            # For each iTunes item in popularity order, try to map to lrclib
-            for item in itunes_items:
-                artist = item.get('artistName') or ''
-                title = item.get('trackName') or ''
-                lrctrack = find_lrclib_match_for_itunes(artist, title)
-                if lrctrack:
-                    tid = lrctrack.get('id')
-                    if tid and tid not in seen_ids:
-                        matched_tracks.append(lrctrack)
-                        seen_ids.add(tid)
-                # Stop if we have enough to display
-                if len(matched_tracks) >= 6:
-                    break
+        # plain text on purpose: Markdown breaks on titles with _ or *
+        status = bot.reply_to(message, f"\U0001f50d Searching for \u201c{(query or '')[:40]}\u201d\u2026")
+    except Exception:
+        status = None
 
-        # If we have iTunes-backed matches, display them in iTunes order
-        if matched_tracks:
-            try:
-                bot.delete_message(message.chat.id, status.message_id)
-            except:
-                pass
-
-            markup = types.InlineKeyboardMarkup()
-            for track in matched_tracks:
-                artist = track.get('artistName', 'Unknown')[:25]
-                title = track.get('trackName', 'Unknown')[:25]
-                btn_text = f"{artist} — {title}"
-                markup.add(types.InlineKeyboardButton(text=btn_text, callback_data=f"sel_{track.get('id')}"))
-            prompt = "Top iTunes matches — select a version:" if requester else "Results:"
-            bot.send_message(message.chat.id, prompt, reply_markup=markup, parse_mode='Markdown', reply_to_message_id=message.message_id)
+    def clear_status():
+        if status is None:
             return
-
-        # 2) Fallback: original lrclib search and ranking if no iTunes matches
-        results = lrclib_get("https://lrclib.net/api/search",
-                             params={'q': query[:80]}, timeout=10)
-        if not isinstance(results, list):
-            results = []
-
-        # Rank results by fuzzy match against the query (title + artist)
-        ranked = []
-        seen_ids = set()
-        for track in results:
-            tid = track.get('id')
-            if tid in seen_ids:
-                continue
-            seen_ids.add(tid)
-            artist = track.get('artistName', '') or ''
-            title = track.get('trackName', '') or ''
-            # Use the whole query as both artist and title hint for scoring
-            score = score_track_match('', query, artist, title)
-            ranked.append((score, track))
-
-        ranked.sort(key=lambda x: x[0], reverse=True)
-        display_tracks = [t for _, t in ranked[:8]]
-
-        if not display_tracks:
-            try:
-                bot.delete_message(message.chat.id, status.message_id)
-            except:
-                pass
-            bot.send_message(message.chat.id, "No results found.", reply_to_message_id=message.message_id)
-            return
-
         try:
-            bot.delete_message(message.chat.id, status.message_id)
-        except:
+            bot.delete_message(chat_id, status.message_id)
+        except Exception:
             pass
 
-        markup = types.InlineKeyboardMarkup()
-        for track in display_tracks:
-            artist = track.get('artistName', 'Unknown')[:25]
-            title = track.get('trackName', 'Unknown')[:25]
-            album = (track.get('albumName') or '')[:18]
-            btn_text = f"{artist} — {title}" + (f" ({album})" if album else "")
-            markup.add(types.InlineKeyboardButton(text=btn_text, callback_data=f"sel_{track.get('id')}"))
+    try:
+        ranked = search_tracks(query, limit=8)
 
-        prompt = "Select a version:" if requester else "Results:"
-        bot.send_message(message.chat.id, prompt, reply_markup=markup, parse_mode='Markdown', reply_to_message_id=message.message_id)
+        if not ranked:
+            clear_status()
+            bot.send_message(
+                chat_id,
+                "\U0001f937 No lyrics found for that.\n\n"
+                "Try one of these:\n"
+                "\u2022 Artist - Song   (e.g. Adele - Hello)\n"
+                "\u2022 just the song name\n"
+                "\u2022 or send me the audio file and tap \u2728 Lyricize",
+                reply_to_message_id=message.message_id)
+            return
+
+        remember_results(chat_id, ranked)
+        best_score, best = ranked[0]
+        confident = best_score >= 88 and (best.get('plainLyrics') or best.get('syncedLyrics'))
+
+        # One clear winner, or only one version at all: skip the extra tap.
+        if len(ranked) == 1 or confident:
+            clear_status()
+            text, markup = build_track_options(best)
+            if len(ranked) > 1:
+                markup.add(types.InlineKeyboardButton(
+                    f"\U0001f50e {len(ranked) - 1} other version{'s' if len(ranked) > 2 else ''}",
+                    callback_data="more"))
+            bot.send_message(chat_id, text, reply_markup=markup,
+                             reply_to_message_id=message.message_id)
+            return
+
+        clear_status()
+        bot.send_message(chat_id, results_text(ranked, query),
+                         reply_markup=results_markup(ranked),
+                         reply_to_message_id=message.message_id)
     except Exception as e:
         print(f"[ERROR] Search exception: {e}")
         import traceback
         traceback.print_exc()
+        clear_status()
         try:
-            bot.delete_message(message.chat.id, status.message_id)
-        except:
+            bot.send_message(chat_id, "\u26a0\ufe0f Search failed for a moment. Please try again.",
+                             reply_to_message_id=message.message_id)
+        except Exception:
             pass
-        try:
-            bot.send_message(message.chat.id, "Connection error.", reply_to_message_id=message.message_id)
-        except:
-            pass
+    finally:
+        gc.collect()
 
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -681,8 +930,9 @@ def start(message):
     bot.send_message(
         message.chat.id,
         "✅ *Welcome!*\n\nSearch lyrics or send music files!\n\n"
-        "_In DM: type song name_\n"
-        "_In groups: /lyrics songname_",
+        "_In DM: just type the song name_\n"
+        "_In groups: /lyrics song name, or reply to one of my messages_\n\n"
+        "Tip: `Artist - Song` gives the best match.",
         reply_markup=get_menu_markup(message.from_user.id),
         parse_mode='Markdown'
     )
@@ -694,9 +944,10 @@ def help_cmd(message):
     bot.send_message(
         message.chat.id,
         "🎵 *Lyrics Bot Guide*\n\n"
-        "🔹 *DM:* Type song name\n"
-        "🔹 *Groups:* /lyrics songname\n"
-        "🔹 *Send MP3:* I'll lyricize it!\n\n"
+        "🔹 *DM:* just type the song name\n"
+        "🔹 *Groups:* /lyrics song name, or reply to one of my messages\n"
+        "🔹 *Send a song file:* I'll put the lyrics inside it!\n\n"
+        "Best results: `Artist - Song` (e.g. Adele - Hello)\n\n"
         "/random /trending /top /stats /diag",
         reply_markup=get_menu_markup(message.from_user.id),
         parse_mode='Markdown'
@@ -748,36 +999,24 @@ def random_song(message):
     save_chat(message.chat)
     stats['random_used'] += 1
     query = random.choice(RANDOM_QUERIES)
-    status = bot.reply_to(message, f"🎲 Fetching *{query}*...", parse_mode='Markdown')
+    status = bot.reply_to(message, f"🎲 Picking a random song…")
     try:
         results = lrclib_get("https://lrclib.net/api/search", params={'q': query}, timeout=10)
         if not isinstance(results, list):
             results = []
         results = results[:6]
+        remember_tracks(results)
         if not results:
             bot.edit_message_text("No results.", message.chat.id, status.message_id)
             return
 
-        pick = random.choice(results)
-        track_id = pick.get('id')
-        t = get_lyrics_by_track_id(track_id)
+        rows = [r for r in results if (r.get('plainLyrics') or r.get('syncedLyrics'))] or results
+        pick = random.choice(rows)
 
-        if not t:
-            bot.edit_message_text("Error fetching track.", message.chat.id, status.message_id)
-            return
-
-        info = f"🎲 *{t.get('artistName', 'Unknown')[:30]} — {t.get('trackName', 'Unknown')[:30]}*\n💿 {t.get('albumName', 'N/A')[:30]}"
-
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        markup.add(
-            types.InlineKeyboardButton("Synced File", callback_data=f"sf_{track_id}"),
-            types.InlineKeyboardButton("Synced Text", callback_data=f"st_{track_id}"),
-            types.InlineKeyboardButton("Plain File", callback_data=f"pf_{track_id}"),
-            types.InlineKeyboardButton("Plain Text", callback_data=f"pt_{track_id}")
-        )
+        text, markup = build_track_options(pick)
         markup.add(types.InlineKeyboardButton("🎲 Another", callback_data="random"))
-        bot.edit_message_text(info, message.chat.id, status.message_id,
-                              reply_markup=markup, parse_mode='Markdown')
+        bot.edit_message_text(f"🎲 {text}", message.chat.id, status.message_id,
+                              reply_markup=markup)
         gc.collect()
     except Exception as e:
         print(f"[ERROR] Random error: {e}")
@@ -817,8 +1056,17 @@ def diag_cmd(message):
         f"metadata_handler.py: {getattr(metadata_handler, 'CODE_VERSION', 'OLD')}",
         f"admin_db.py: {getattr(admin_db, 'CODE_VERSION', 'OLD')}",
         f"python: {sys.version.split()[0]}",
+        f"search: {'admins only' if RESTRICT_TO_ADMINS else 'open to everyone'}",
+        f"groups: {'every message' if GROUP_PLAIN_TEXT else 'replies + /lyrics only'}",
         "",
     ]
+    try:
+        started = time.time()
+        rows = search_tracks("adele hello", limit=1)
+        elapsed = time.time() - started
+        lines.append(f"{'✅' if rows else '❌'} lrclib search ({elapsed:.1f}s)")
+    except Exception as e:
+        lines.append(f"❌ lrclib search: {type(e).__name__}: {e}")
     try:
         results = metadata_handler.self_test()
         for fmt, ok in results:
@@ -831,6 +1079,7 @@ def diag_cmd(message):
 
     bot.reply_to(message, "\n".join(lines))
     gc.collect()
+
 
 @bot.message_handler(commands=['addadmin'])
 def addadmin_cmd(message):
@@ -954,14 +1203,76 @@ def process_remove_admin_id(message):
 
 @bot.message_handler(func=lambda m: m.chat.type == 'private')
 def dm_search(message):
+    """Any text sent in a private chat is a lyrics search.
+
+    Previously this answered "Access Denied" to everyone who was not an admin,
+    which is why the bot looked dead for normal users. Set RESTRICT_TO_ADMINS=1
+    in the environment to bring that back.
+    """
     save_chat(message.chat)
-    if not admin_db.is_admin(message.from_user.id):
-        bot_username = bot.get_me().username
+    if RESTRICT_TO_ADMINS and not admin_db.is_admin(message.from_user.id):
+        try:
+            bot_username = bot.get_me().username
+        except Exception:
+            bot_username = None
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("Start", url=f"https://t.me/{bot_username}?start=true"))
-        bot.reply_to(message, "⛔ Access Denied.", reply_markup=markup, parse_mode='Markdown')
+        if bot_username:
+            markup.add(types.InlineKeyboardButton("Start", url=f"https://t.me/{bot_username}?start=true"))
+        bot.reply_to(message, "⛔ Access Denied.", reply_markup=markup)
         return
+
     query = (message.text or "").strip()
+    if not query:
+        return
+    do_search(message, query[:100])
+
+
+def _bot_id():
+    """Our own user id, cached (used to spot replies to the bot)."""
+    global BOT_ID
+    if BOT_ID is None:
+        try:
+            BOT_ID = bot.get_me().id
+        except Exception:
+            BOT_ID = 0
+    return BOT_ID
+
+
+def strip_bot_mention(text):
+    """Remove a leading @our_bot_name from a query."""
+    cleaned = text or ""
+    try:
+        username = (bot.get_me().username or "").strip()
+    except Exception:
+        username = ""
+    if username:
+        cleaned = re.sub(r"^\s*@?" + re.escape(username) + r"\b[:,]?\s*",
+                         "", cleaned, flags=re.I)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+@bot.message_handler(func=lambda m: m.chat.type in ('group', 'supergroup'))
+def group_text(message):
+    """Answer plain text in groups.
+
+    Telegram's privacy mode is ON by default, so the bot only ever receives
+    commands and replies to its own messages. Replies are always answered; set
+    GROUP_PLAIN_TEXT=1 (and turn privacy mode off in @BotFather, then re-add
+    the bot) to answer every message in the group.
+    """
+    save_chat(message.chat)
+    text = (message.text or "").strip()
+    if not text or text.startswith('/'):
+        return
+
+    reply = getattr(message, 'reply_to_message', None)
+    from_user = getattr(reply, 'from_user', None) if reply is not None else None
+    is_reply_to_bot = bool(from_user and getattr(from_user, 'id', None) == _bot_id())
+
+    if not (GROUP_PLAIN_TEXT or is_reply_to_bot):
+        return
+
+    query = strip_bot_mention(text)
     if not query:
         return
     do_search(message, query[:100])
@@ -997,6 +1308,7 @@ def detect_audio_ext(message, file_info=None):
         return '.mp3'
     return None
 
+
 def guess_artist_title_from_filename(original_name):
     """'Artist - Title (Official Audio).mp3' -> ('Artist', 'Title')."""
     if not original_name:
@@ -1011,6 +1323,7 @@ def guess_artist_title_from_filename(original_name):
     if len(parts) == 2 and parts[0].strip() and parts[1].strip():
         return parts[0].strip()[:80], parts[1].strip()[:80]
     return None, (base[:80] or None)
+
 
 def find_track_for_metadata(metadata, original_name):
     """Find lyrics for an upload, falling back to the original file name.
@@ -1048,6 +1361,7 @@ def find_track_for_metadata(metadata, original_name):
             return track
     return None
 
+
 def save_tracking(file_name, file_path, track_id, file_id=None, user_id=None,
                   original_name=None, artist=None, title=None):
     """Save tracking info, tolerating an older admin_db.py during upgrades."""
@@ -1066,6 +1380,7 @@ def save_tracking(file_name, file_path, track_id, file_id=None, user_id=None,
     except Exception as e:
         print(f"[ERROR] Save file tracking failed: {e}")
 
+
 def lookup_tracking(file_name=None, track_id=None):
     """Find a tracking row by file name (preferred) or by lyrics track id."""
     try:
@@ -1082,7 +1397,7 @@ def lookup_tracking(file_name=None, track_id=None):
     except Exception as e:
         print(f"[ERROR] Tracking lookup by track failed: {e}")
     return None
-
+    
 def rehydrate_tracked_file(entry):
     """Return a usable local path, re-downloading from Telegram if needed.
 
@@ -1119,6 +1434,7 @@ def rehydrate_tracked_file(entry):
     except Exception as e:
         print(f"[ERROR] Re-download failed: {e}")
         return None
+
 
 @bot.message_handler(content_types=['audio', 'document', 'video', 'voice'])
 def handle_music_file(message):
@@ -1345,6 +1661,7 @@ def handle_music_file(message):
         print("[DEBUG] ===== MUSIC FILE PROCESSING END (EXCEPTION) =====\n")
         gc.collect()
 
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith('view_lyrics_'))
 def view_lyrics_callback(call):
     save_chat(call.message.chat)
@@ -1423,6 +1740,7 @@ def prepare_embed_callback(call):
 
     bot.send_message(call.message.chat.id, "Choose lyrics type to embed:", reply_markup=markup)
     gc.collect()
+
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('do_embed_'))
 def do_embed_callback(call):
@@ -1531,6 +1849,7 @@ def do_embed_callback(call):
             pass
         gc.collect()
 
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith('trend_'))
 def handle_trending_pick(call):
     save_chat(call.message.chat)
@@ -1541,6 +1860,7 @@ def handle_trending_pick(call):
         if not isinstance(results, list):
             results = []
         results = results[:6]
+        remember_tracks(results)
 
         if not results:
             bot.answer_callback_query(call.id, "No results.")
@@ -1565,34 +1885,11 @@ def show_options(call):
 
     t = get_lyrics_by_track_id(track_id)
     if not t:
-        bot.answer_callback_query(call.id, "Error.")
+        bot.answer_callback_query(call.id, "Could not load that track. Please search again.")
         return
 
-    artist = t.get('artistName', 'Unknown')
-    title = t.get('trackName', 'Unknown')
-    album = t.get('albumName') or ''
-    duration = t.get('duration')
-    dur_str = f"{duration//60}:{duration%60:02d}" if duration else ""
-    info = f"🎵 *{artist[:30]}*\n📝 {title[:30]}"
-    if album:
-        info += f"\n💿 {album[:30]}"
-    if dur_str:
-        info += f"\n⏱ {dur_str}"
-
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    if t.get('syncedLyrics'):
-        markup.add(
-            types.InlineKeyboardButton("Syn→File", callback_data=f"sf_{track_id}"),
-            types.InlineKeyboardButton("Syn→Text", callback_data=f"st_{track_id}")
-        )
-    if t.get('plainLyrics'):
-        markup.add(
-            types.InlineKeyboardButton("Pln→File", callback_data=f"pf_{track_id}"),
-            types.InlineKeyboardButton("Pln→Text", callback_data=f"pt_{track_id}")
-        )
-    markup.add(types.InlineKeyboardButton("⬅️", callback_data="back"))
-
-    bot.edit_message_text(info, call.message.chat.id, call.message.message_id, reply_markup=markup)
+    text, markup = build_track_options(t)
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
     gc.collect()
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith(('sf_', 'st_', 'pf_', 'pt_')))
@@ -1605,51 +1902,60 @@ def deliver_lyrics(call):
 
     t = get_lyrics_by_track_id(track_id)
     if not t:
-        bot.answer_callback_query(call.id, "Error.")
+        bot.answer_callback_query(call.id, "Could not load that track. Please search again.")
         return
 
     name = f"{t.get('artistName', 'Unknown')[:20]} - {t.get('trackName', 'Unknown')[:20]}"
+    chat_id = call.message.chat.id
 
-    if cmd == "sf":
-        data = t.get('syncedLyrics')
-        if data:
-            bio = io.BytesIO(data[:50000].encode('utf-8'))
-            bio.name = f"{name}.lrc"
-            bot.send_document(call.message.chat.id, bio)
-            del bio
-        else:
-            bot.answer_callback_query(call.id, "Not available.")
-    elif cmd == "st":
-        data = t.get('syncedLyrics')
-        if data and len(data) <= 3500:
-            bot.send_message(call.message.chat.id, f"`{data[:3500]}`", parse_mode='Markdown')
-        elif data:
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("Send as file", callback_data=f"sf_{track_id}"))
-            bot.send_message(call.message.chat.id, "⚠️ Too long for text. Use file option?", reply_markup=markup)
-        else:
-            bot.answer_callback_query(call.id, "Not available.")
-    elif cmd == "pf":
-        data = t.get('plainLyrics')
-        if data:
-            bio = io.BytesIO(data[:50000].encode('utf-8'))
-            bio.name = f"{name}.txt"
-            bot.send_document(call.message.chat.id, bio)
-            del bio
-        else:
-            bot.answer_callback_query(call.id, "Not available.")
-    elif cmd == "pt":
-        data = t.get('plainLyrics')
-        if data and len(data) <= 4000:
-            bot.send_message(call.message.chat.id, data[:4000])
-        elif data:
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("Send as file", callback_data=f"pf_{track_id}"))
-            bot.send_message(call.message.chat.id, "⚠️ Too long for text. Use file option?", reply_markup=markup)
-        else:
-            bot.answer_callback_query(call.id, "Not available.")
+    try:
+        if cmd == "sf":
+            data = t.get('syncedLyrics')
+            if data:
+                bio = io.BytesIO(data[:50000].encode('utf-8'))
+                bio.name = f"{name}.lrc"
+                bot.send_document(chat_id, bio)
+                del bio
+            else:
+                bot.answer_callback_query(call.id, "Not available.")
+                return
+        elif cmd == "st":
+            # plain text, not Markdown: lyrics with * or ` used to break this
+            data = t.get('syncedLyrics')
+            if not data:
+                bot.answer_callback_query(call.id, "No synced lyrics for this one.")
+                return
+            send_long_text(chat_id, data)
+        elif cmd == "pf":
+            data = t.get('plainLyrics')
+            if data:
+                bio = io.BytesIO(data[:50000].encode('utf-8'))
+                bio.name = f"{name}.txt"
+                bot.send_document(chat_id, bio)
+                del bio
+            else:
+                bot.answer_callback_query(call.id, "Not available.")
+                return
+        elif cmd == "pt":
+            data = t.get('plainLyrics')
+            if not data:
+                bot.answer_callback_query(call.id, "No plain lyrics for this one.")
+                return
+            send_long_text(chat_id, data)
+    except Exception as e:
+        print(f"[ERROR] Deliver lyrics failed: {e}")
+        try:
+            bot.answer_callback_query(call.id, "Something went wrong, try again.")
+        except Exception:
+            pass
+        return
 
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
     gc.collect()
+
 
 @bot.callback_query_handler(func=lambda call: call.data == "random")
 def random_callback(call):
@@ -1665,33 +1971,53 @@ def random_callback(call):
             bot.answer_callback_query(call.id, "Error.")
             return
 
-        pick = random.choice(results)
-        t = get_lyrics_by_track_id(pick.get('id'))
-        if not t:
-            bot.answer_callback_query(call.id, "Error.")
-            return
+        remember_tracks(results)
+        rows = [r for r in results if (r.get('plainLyrics') or r.get('syncedLyrics'))] or results
+        pick = random.choice(rows)
 
-        info = f"🎲 *{t.get('artistName', 'Unknown')[:25]}*\n📝 {t.get('trackName', 'Unknown')[:25]}"
-
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        markup.add(
-            types.InlineKeyboardButton("Syn→F", callback_data=f"sf_{pick.get('id')}"),
-            types.InlineKeyboardButton("Syn→T", callback_data=f"st_{pick.get('id')}"),
-            types.InlineKeyboardButton("Pln→F", callback_data=f"pf_{pick.get('id')}"),
-            types.InlineKeyboardButton("Pln→T", callback_data=f"pt_{pick.get('id')}")
-        )
-        markup.add(types.InlineKeyboardButton("🎲", callback_data="random"))
-
-        bot.edit_message_text(info, call.message.chat.id, call.message.message_id,
-                              reply_markup=markup, parse_mode='Markdown')
+        text, markup = build_track_options(pick)
+        markup.add(types.InlineKeyboardButton("🎲 Another", callback_data="random"))
+        bot.edit_message_text(f"🎲 {text}", call.message.chat.id, call.message.message_id,
+                              reply_markup=markup)
         gc.collect()
     except Exception as e:
         print(f"[ERROR] Random error: {e}")
+        try:
+            bot.answer_callback_query(call.id, "Error.")
+        except Exception:
+            pass
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "more")
+def more_results(call):
+    """Show the other versions we found (everything except the top hit)."""
+    save_chat(call.message.chat)
+    ranked = last_results.get(str(call.message.chat.id)) or []
+    rest = ranked[1:]
+    if not rest:
+        bot.answer_callback_query(call.id, "No other versions.")
+        return
+    try:
+        bot.edit_message_text(results_text(rest), call.message.chat.id,
+                              call.message.message_id, reply_markup=results_markup(rest))
+    except Exception as e:
+        print(f"[ERROR] More results failed: {e}")
         bot.answer_callback_query(call.id, "Error.")
+    gc.collect()
+
 
 @bot.callback_query_handler(func=lambda call: call.data == "back")
 def back(call):
     save_chat(call.message.chat)
+    ranked = last_results.get(str(call.message.chat.id)) or []
+    if ranked:
+        try:
+            bot.edit_message_text(results_text(ranked), call.message.chat.id,
+                                  call.message.message_id, reply_markup=results_markup(ranked))
+            gc.collect()
+            return
+        except Exception as e:
+            print(f"[DEBUG] Back-to-results failed: {e}")
     bot.edit_message_text("Use menu below.", call.message.chat.id, call.message.message_id)
     gc.collect()
 
