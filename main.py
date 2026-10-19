@@ -2050,6 +2050,12 @@ if __name__ == "__main__":
     print(f"[INFO] Versions -> main.py {CODE_VERSION} | "
           f"metadata_handler.py {getattr(metadata_handler, 'CODE_VERSION', 'OLD')} | "
           f"admin_db.py {getattr(admin_db, 'CODE_VERSION', 'OLD')}")
+        import sys
+    sys.modules['main'] = sys.modules['__main__']
+    try:
+        import search_fix
+    except Exception as e:
+        print(f"[ERROR] search_fix could not be loaded: {e}")
     bot_thread = Thread(target=start_bot, daemon=True)
     bot_thread.daemon = True
     bot_thread.start()
