@@ -1,11 +1,19 @@
 """search_fix.py - small add-on for the Lyrics Finder Bot (main.py 1.4).
 
-INSTALL (about 2 minutes, no big copy/paste):
-  1. Add this file to your repo, next to main.py:
-       GitHub -> Add file -> Create new file -> name it  search_fix.py
-  2. Open main.py, scroll to the very BOTTOM and add ONE line:
-       import search_fix
-  3. Commit changes. Render redeploys on its own.
+INSTALL (main.py must load this INSIDE its __main__ block, not at the very
+bottom of the file - app.run() never returns, so a last-line import is dead
+code).  main.py needs these 6 lines just above
+"bot_thread = Thread(target=start_bot, daemon=True)":
+
+    import sys
+    sys.modules['main'] = sys.modules['__main__']
+    try:
+        import search_fix
+    except Exception as e:
+        print(f"[ERROR] search_fix could not be loaded: {e}")
+
+Render logs must show:
+    [INFO] search_fix loaded: groups, lyric search, copyable lyrics, uploads for everyone
 
 WHAT IT FIXES / ADDS
   * tap-to-copy lyrics again - lyrics come back inside a code block, safely
@@ -14,6 +22,10 @@ WHAT IT FIXES / ADDS
     bot now work - and song uploads work in groups, so you can embed there
   * /lyrics and song uploads are no longer admin-only
   * search by lyrics: /find a line from the song  (needs a free GENIUS_TOKEN)
+  * a search can never end in silence: the "Searching..." message is turned
+    into the answer, so the result cannot just disappear
+  * lyrics arrive as a REPLY to the message you searched with; when lyrics
+    need several bubbles only the first one is a reply
   * when a search fails you get the real reason instead of "no lyrics found"
 
 STILL NEEDED (Telegram setting, not code):
@@ -89,6 +101,38 @@ def send_copyable(chat_id, text, reply_to=None):
                              reply_to_message_id=reply_to if i == 0 else None)
 
 
+def report(message, status, body, markup=None):
+    """Show a result in place of the "Searching…" message, never silently drop it.
+
+    Order of attempts:
+      1. edit the "Searching…" message into the answer  (nothing disappears)
+      2. delete it and send the answer as a reply to the user's message
+      3. send the answer without a reply
+    """
+    chat_id = message.chat.id
+    if status is not None:
+        try:
+            bot.edit_message_text(body, chat_id, status.message_id,
+                                  reply_markup=markup)
+            return
+        except Exception as e:
+            print(f"[DEBUG] search_fix: could not edit status message: {e}")
+        try:
+            bot.delete_message(chat_id, status.message_id)
+        except Exception:
+            pass
+    try:
+        bot.send_message(chat_id, body, reply_markup=markup,
+                         reply_to_message_id=message.message_id)
+        return
+    except Exception as e:
+        print(f"[DEBUG] search_fix: reply failed, sending plain: {e}")
+    try:
+        bot.send_message(chat_id, body, reply_markup=markup)
+    except Exception as e:
+        print(f"[ERROR] search_fix: could not report to user at all: {e}")
+
+
 # ---------------------------------------------------------------- searching
 def probe_lrclib():
     """Ask the lyrics service once, so a failed search can say why."""
@@ -104,7 +148,28 @@ def probe_lrclib():
         return f"error: {e}"
 
 
+def _guarded(fn, message, arg):
+    """Never let a search die in silence - the user always sees something."""
+    holder = {}
+    try:
+        fn(message, arg, holder)
+    except Exception as e:
+        print(f"[ERROR] search_fix: {fn.__name__} crashed: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            report(message, holder.get('status'),
+                   "\u26a0\ufe0f Something went wrong handling that search.\n"
+                   "Please try again, or send /diag and show me the reply.")
+        except Exception as e2:
+            print(f"[ERROR] search_fix: could not even report the crash: {e2}")
+
+
 def do_search(message, query):
+    _guarded(_do_search, message, query)
+
+
+def _do_search(message, query, holder):
     """Search, and if nothing comes back, say why."""
     try:
         main.save_chat(message.chat)
@@ -122,6 +187,7 @@ def do_search(message, query):
             message, f"\U0001f50d Searching for \u201c{(query or '')[:40]}\u201d\u2026")
     except Exception:
         status = None
+    holder['status'] = status
 
     def clear():
         if status is None:
@@ -150,33 +216,26 @@ def do_search(message, query):
             backup = None
 
         if backup:
-            clear()
             track = make_backup_track(artist_part, title_part, backup)
             text, markup = main.build_track_options(track)
-            bot.send_message(chat_id,
-                             "ℹ️ Found the lyrics on the backup source.\n\n" + text,
-                             reply_markup=markup, reply_to_message_id=message.message_id)
+            report(message, status,
+                   "ℹ️ Found the lyrics on the backup source.\n\n" + text,
+                   markup=markup)
             return
 
-        clear()
         why = probe_lrclib()
         if why == "ok":
-            bot.send_message(
-                chat_id,
-                "\U0001f937 No lyrics found for that.\n\n"
-                "Try: Artist - Song   (e.g. Adele - Hello)\n"
-                "Or send me the audio file and tap \u2728 Lyricize.",
-                reply_to_message_id=message.message_id)
+            report(message, status,
+                   "\U0001f937 No lyrics found for that.\n\n"
+                   "Try: Artist - Song   (e.g. Adele - Hello)\n"
+                   "Or send me the audio file and tap \u2728 Lyricize.")
         else:
-            bot.send_message(
-                chat_id,
-                f"\u26a0\ufe0f The lyrics service isn't answering right now ({why}).\n\n"
-                "Please try again in a minute.\n"
-                "If it keeps happening, send /diag and show me the reply.",
-                reply_to_message_id=message.message_id)
+            report(message, status,
+                   f"\u26a0\ufe0f The lyrics service isn't answering right now ({why}).\n\n"
+                   "Please try again in a minute.\n"
+                   "If it keeps happening, send /diag and show me the reply.")
         return
 
-    clear()
     try:
         main.remember_results(chat_id, ranked)
     except Exception:
@@ -191,12 +250,10 @@ def do_search(message, query):
             markup.add(types.InlineKeyboardButton(
                 f"\U0001f50e {len(ranked) - 1} other version{'s' if len(ranked) > 2 else ''}",
                 callback_data="more"))
-        bot.send_message(chat_id, text, reply_markup=markup,
-                         reply_to_message_id=message.message_id)
+        report(message, status, text, markup=markup)
     else:
-        bot.send_message(chat_id, main.results_text(ranked, query),
-                         reply_markup=main.results_markup(ranked),
-                         reply_to_message_id=message.message_id)
+        report(message, status, main.results_text(ranked, query),
+               markup=main.results_markup(ranked))
 
 
 # ------------------------------------------- fallback lyrics source (no key)
@@ -276,6 +333,10 @@ def genius_search(fragment, limit=5):
 
 
 def do_lyric_fragment_search(message, fragment):
+    _guarded(_do_lyric_fragment_search, message, fragment)
+
+
+def _do_lyric_fragment_search(message, fragment, holder):
     try:
         main.save_chat(message.chat)
     except Exception:
@@ -291,6 +352,7 @@ def do_lyric_fragment_search(message, fragment):
         status = bot.reply_to(message, "\U0001f50e Looking for the song with those words\u2026")
     except Exception:
         status = None
+    holder['status'] = status
 
     def clear():
         if status is None:
@@ -301,17 +363,14 @@ def do_lyric_fragment_search(message, fragment):
             pass
 
     if not GENIUS_TOKEN:
-        clear()
-        bot.send_message(
-            message.chat.id,
-            "\U0001f50e Search-by-lyrics needs a free Genius token (about 2 minutes):\n\n"
-            "1. Open genius.com/developers and sign in\n"
-            "2. New API Client -> any name -> Save\n"
-            "3. Copy the Access Token\n"
-            "4. Render -> your service -> Environment -> add:\n"
-            "     GENIUS_TOKEN = <your token>\n\n"
-            "Searching by song name and sending the file both work without it.",
-            reply_to_message_id=message.message_id)
+        report(message, status,
+               "\U0001f50e Search-by-lyrics needs a free Genius token (about 2 minutes):\n\n"
+               "1. Open genius.com/developers and sign in\n"
+               "2. New API Client -> any name -> Save\n"
+               "3. Copy the Access Token\n"
+               "4. Render -> your service -> Environment -> add:\n"
+               "     GENIUS_TOKEN = <your token>\n\n"
+               "Searching by song name and sending the file both work without it.")
         return
 
     rows = []
@@ -321,12 +380,9 @@ def do_lyric_fragment_search(message, fragment):
             rows.append(ranked[0][1])
 
     if not rows:
-        clear()
-        bot.send_message(
-            message.chat.id,
-            "\U0001f937 No song matched those words.\n\n"
-            "Try an exact line from the chorus, or just send the song name.",
-            reply_to_message_id=message.message_id)
+        report(message, status,
+               "\U0001f937 No song matched those words.\n\n"
+               "Try an exact line from the chorus, or just send the song name.")
         return
 
     try:
@@ -334,7 +390,6 @@ def do_lyric_fragment_search(message, fragment):
     except Exception:
         pass
     ranked = [(95 - i * 2, row) for i, row in enumerate(rows)]
-    clear()
     try:
         main.remember_results(message.chat.id, ranked)
     except Exception:
@@ -345,8 +400,7 @@ def do_lyric_fragment_search(message, fragment):
         markup.add(types.InlineKeyboardButton(
             f"\U0001f50e {len(ranked) - 1} other version{'s' if len(ranked) > 2 else ''}",
             callback_data="more"))
-    bot.send_message(message.chat.id, text, reply_markup=markup,
-                     reply_to_message_id=message.message_id)
+    report(message, status, text, markup=markup)
 
 
 # ---------------------------------------------------------------- handlers
@@ -493,6 +547,16 @@ def _deliver_lyrics_copyable(call):
             f" - {track.get('trackName', 'Unknown')[:20]}")
     chat_id = call.message.chat.id
 
+    # Answer in the same thread as the message the user searched with, so the
+    # lyrics show up as a reply to their own text instead of a stray message.
+    # The track card was sent as a reply, so its reply_to_message is the query.
+    reply_to = None
+    original = getattr(call.message, 'reply_to_message', None)
+    if original is not None and getattr(original, 'message_id', None):
+        reply_to = original.message_id
+    else:
+        reply_to = getattr(call.message, 'message_id', None)
+
     try:
         if cmd in ('sf', 'pf'):
             data = track.get('syncedLyrics') if cmd == 'sf' else track.get('plainLyrics')
@@ -501,7 +565,7 @@ def _deliver_lyrics_copyable(call):
                 return
             bio = io.BytesIO(data[:50000].encode('utf-8'))
             bio.name = f"{name}.lrc" if cmd == 'sf' else f"{name}.txt"
-            bot.send_document(chat_id, bio)
+            bot.send_document(chat_id, bio, reply_to_message_id=reply_to)
             del bio
         else:
             data = track.get('syncedLyrics') if cmd == 'st' else track.get('plainLyrics')
@@ -510,7 +574,9 @@ def _deliver_lyrics_copyable(call):
                     call.id,
                     "No synced lyrics for this one." if cmd == 'st' else "No plain lyrics for this one.")
                 return
-            send_copyable(chat_id, data)
+            # send_copyable replies on the FIRST bubble only; the rest follow on
+            # as ordinary messages so the chat does not fill up with replies.
+            send_copyable(chat_id, data, reply_to)
     except Exception as e:
         print(f"[ERROR] search_fix deliver failed: {e}")
         try:
