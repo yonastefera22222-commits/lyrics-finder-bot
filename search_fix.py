@@ -26,6 +26,10 @@ HOW SEARCHING WORKS NOW
   * album name and track duration are shown on every answer: the list, the
     track card, and the header above the lyrics
   * iTunes is not used at all any more - every lookup goes to lrclib
+  * REPLY to a song file with /lyrics and the bot treats that file as the
+    search - it looks the song up and offers to embed the lyrics into it
+  * the "Add to Group" button hands out a link that makes the user pick one
+    of their groups and adds the bot to it as an ADMIN in one go
 
 STILL NEEDED (Telegram setting, not code):
   In your group make the bot an ADMIN, otherwise Telegram never delivers normal
@@ -707,17 +711,74 @@ def _promote(collection):
         pass
 
 
+BTN_ADD_GROUP = getattr(main, 'BTN_ADD_GROUP', "\u2795 Add to Group")
+
+
+def _reply_has_media(message):
+    """The replied-to message, if it carries a song file. Otherwise None."""
+    target = getattr(message, 'reply_to_message', None)
+    if target is None:
+        return None
+    for attr in ('audio', 'document', 'video', 'voice'):
+        if getattr(target, attr, None) is not None:
+            return target
+    return None
+
+
+def _handle_file(message, target):
+    """Run the normal upload/embed flow on the file that was replied to.
+
+    main.py's upload handler checks is_admin() itself, so admin rights are
+    borrowed for the duration of the call and then put back - the same trick
+    the upload handler below uses.
+    """
+    original = admin_db.is_admin
+    admin_db.is_admin = lambda user_id: True
+    try:
+        main.handle_music_file(target)
+    finally:
+        admin_db.is_admin = original
+
+
+def add_group_url(bot_username):
+    """Deep link that asks the user to PICK a group and adds us as an admin.
+
+    Without the admin parameter the bot is added as a normal member, which
+    means Telegram never delivers ordinary group messages to it.
+    """
+    perms = "delete_messages"
+    return f"https://t.me/{bot_username}?startgroup&admin={perms}"
+
+
 @bot.message_handler(commands=['lyrics', 'search', 'song', 'find', 'words'])
 def _anyone_can_search(message):
     if not allowed(message.from_user.id):
         bot.reply_to(message, "\u26d4 Access Denied.")
         return
     parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        bot.reply_to(message, "Usage:\n/lyrics Artist - Song - Album\n/find a line from the song")
-        return
     command = parts[0].split('@')[0].lower()
-    text = parts[1].strip()
+    text = parts[1].strip() if len(parts) > 1 else ""
+
+    # "/lyrics" as a REPLY to a song file -> treat the file as the search,
+    # exactly as if the user had just uploaded it.
+    if command in ('/lyrics', '/search', '/song'):
+        target = _reply_has_media(message)
+        if target is not None and not text:
+            try:
+                main.save_chat(message.chat)
+            except Exception:
+                pass
+            _handle_file(message, target)
+            return
+
+    if not text:
+        bot.reply_to(message,
+                     "Usage:\n/lyrics Artist - Song - Album\n"
+                     "/find a line from the song\n\n"
+                     "Or reply to a song file with /lyrics to look it up "
+                     "and embed the lyrics into that file.")
+        return
+
     if command in ('/find', '/words'):
         do_lyric_fragment_search(message, text[:200])
     else:
@@ -816,6 +877,84 @@ def _uploads_for_everyone(message):
 
 
 _promote(bot.message_handlers)
+
+
+@bot.message_handler(func=lambda m: (m.text or "") == BTN_ADD_GROUP)
+def _add_to_group(message):
+    """Explain the group setup and hand over a link that adds us as admin."""
+    try:
+        main.save_chat(message.chat)
+    except Exception:
+        pass
+    try:
+        username = (bot.get_me().username or "").strip()
+    except Exception:
+        username = ""
+
+    body = (
+        "\u2795 *Add me to one of your groups*\n\n"
+        "Tap the button below and Telegram will ask you to pick a group. "
+        "When it shows the permissions, please leave *Delete messages* ticked "
+        "\u2014 I only use it to tidy up my own \u201cSearching\u2026\u201d messages.\n\n"
+        "*Why does it need to be an admin?*\n"
+        "Telegram does not deliver ordinary group messages to a bot that is a "
+        "normal member. Until I am an admin I can only answer /lyrics and "
+        "/find in your group \u2014 plain song names and uploads will look ignored.\n\n"
+        "*Already added me?*\n"
+        "Group name \u2192 Edit \u2192 Administrators \u2192 Add Admin \u2192 pick me."
+    )
+
+    markup = types.InlineKeyboardMarkup()
+    if username:
+        markup.add(types.InlineKeyboardButton(
+            "\u2795 Choose a group\u2026", url=add_group_url(username)))
+    markup.add(types.InlineKeyboardButton(
+        "\u2705 I've added it \u2014 what next?", callback_data="addgrp_next"))
+
+    try:
+        bot.send_message(message.chat.id, body, parse_mode='Markdown',
+                         reply_markup=markup,
+                         reply_to_message_id=message.message_id)
+    except Exception as e:
+        print(f"[DEBUG] add-to-group markdown failed, plain fallback: {e}")
+        bot.send_message(message.chat.id, body.replace('*', ''),
+                         reply_markup=markup,
+                         reply_to_message_id=message.message_id)
+
+
+_promote(bot.message_handlers)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'addgrp_next')
+def _add_group_next(call):
+    """What to do once the bot is in the group."""
+    try:
+        username = (bot.get_me().username or "").strip()
+    except Exception:
+        username = "your bot"
+
+    body = (
+        "\u2705 *Now try this in the group*\n\n"
+        f"1. Make sure I am an admin: group name \u2192 Edit \u2192 "
+        "Administrators \u2192 Add Admin \u2192 pick me.\n"
+        f"2. Type:  `!song Adele - Hello - 25`\n"
+        f"3. Or reply to a song file with `/lyrics` and I will find the "
+        "lyrics and offer to embed them.\n\n"
+        "If typing a song name still does nothing, I am not an admin yet \u2014 "
+        "that is the only thing that stops it.\n\n"
+        f"My username: @{username}"
+    )
+    try:
+        bot.send_message(call.message.chat.id, body, parse_mode='Markdown')
+    except Exception:
+        bot.send_message(call.message.chat.id, body.replace('*', '').replace('`', ''))
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+
+_promote(bot.callback_query_handlers)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('pick_'))
