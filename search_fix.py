@@ -30,6 +30,10 @@ HOW SEARCHING WORKS NOW
     search - it looks the song up and offers to embed the lyrics into it
   * the "Add to Group" button hands out a link that makes the user pick one
     of their groups and adds the bot to it as an ADMIN in one go
+  * HTTP 503 (and 500/502/504, timeouts, dropped connections) from lrclib,
+    lyrics.ovh or Genius are retried automatically with backoff, so a brief
+    outage never reaches the user; if a service stays down, searches pause
+    briefly and fall back to the backup source instead of hammering it
 
 STILL NEEDED (Telegram setting, not code):
   In your group make the bot an ADMIN, otherwise Telegram never delivers normal
@@ -63,12 +67,25 @@ MENU = set(getattr(main, 'MENU_BUTTONS', ()) or ())
 # got worse. This replacement sends at most one request every MIN_GAP seconds
 # and, on a 429, stops talking to lrclib for COOLDOWN seconds instead of
 # retrying.
+#
+# 503 IMMUNITY (and 500/502/504, dropped connections, timeouts):
+# those are TRANSIENT - the service is briefly overloaded or restarting and
+# usually answers again within seconds. _http_get_json() below retries them
+# with exponential backoff + jitter (honouring Retry-After), so a momentary
+# 503 blip never reaches the user. If the service stays down through every
+# retry, a short outage pause (OUTAGE_PAUSE) stops further searches from
+# hammering it, the status is recorded for the user-facing message, and the
+# caller falls back to the backup lyrics source as before.
 LRCLIB_HEADERS = getattr(main, 'LRCLIB_HEADERS', {
     'User-Agent': 'LyricsFinderBot/1.1 (+https://lrclib.net)',
     'Accept': 'application/json',
 })
 MIN_GAP = float(os.environ.get('LRCLIB_MIN_GAP', '1.2'))
 COOLDOWN = float(os.environ.get('LRCLIB_COOLDOWN', '20'))
+OUTAGE_PAUSE = float(os.environ.get('LRCLIB_OUTAGE_PAUSE', '10'))
+MAX_ATTEMPTS = max(1, int(os.environ.get('LRCLIB_ATTEMPTS', '4')))
+RETRY_BASE = float(os.environ.get('LRCLIB_RETRY_BASE', '0.8'))
+TRANSIENT_STATUSES = {500, 502, 503, 504}
 
 _lrclib_lock = threading.Lock()
 _last_call = [0.0]
@@ -83,43 +100,106 @@ def last_lrclib_status():
     return _last_status[0]
 
 
+def _retry_delay(attempt, res=None):
+    """Seconds to wait before the next try: backoff + jitter, Retry-After wins."""
+    delay = min(RETRY_BASE * (2 ** attempt), 8.0)
+    try:
+        import random
+        delay += random.uniform(0, 0.4)
+    except Exception:
+        pass
+    if res is not None:
+        try:
+            ra = float((res.headers or {}).get('Retry-After') or 0)
+            if ra > 0:
+                delay = min(ra, 10.0)
+        except Exception:
+            pass
+    return delay
+
+
+def _http_get_json(url, params=None, headers=None, timeout=10, attempts=3,
+                   label='http'):
+    """GET JSON, retrying transient failures. NEVER raises.
+
+    Returns (status_code, data); status_code is None when no HTTP response
+    arrived at all (timeout, DNS, connection reset...), data is None unless
+    the body parsed as JSON. 4xx answers (except 429) are returned at once -
+    retrying a wrong request only makes things worse.
+    """
+    import requests
+    status, data = None, None
+    for attempt in range(max(1, attempts)):
+        res = None
+        try:
+            res = requests.get(url, params=params, headers=headers,
+                               timeout=timeout)
+            status = res.status_code
+        except Exception as e:
+            status, data = None, None
+            print(f"[WARN] {label}: request error ({e}); "
+                  f"attempt {attempt + 1}/{attempts}")
+        if res is not None:
+            if status == 200:
+                try:
+                    return 200, res.json()
+                except Exception:
+                    return 200, None     # bad body - retrying won't fix it
+            if status not in TRANSIENT_STATUSES and status != 429:
+                return status, None      # 400/404/...: definitive answer
+            print(f"[WARN] {label}: HTTP {status}; "
+                  f"attempt {attempt + 1}/{attempts}")
+        if attempt < attempts - 1:
+            time.sleep(_retry_delay(attempt, res))
+    return status, data
+
+
 def _throttled_lrclib_get(url, params=None, timeout=10):
-    """Rate-limited replacement for main.lrclib_get."""
+    """Rate-limited, 503-proof replacement for main.lrclib_get."""
     if time.time() < _cooldown_until[0]:
         return None                       # still cooling off - do not even ask
-    with _lrclib_lock:
-        wait = MIN_GAP - (time.time() - _last_call[0])
-        if wait > 0:
-            time.sleep(wait)
-        _last_call[0] = time.time()
-    try:
-        import requests
-        res = requests.get(url, params=params, headers=LRCLIB_HEADERS,
-                           timeout=timeout)
-    except Exception as e:
-        _last_status[0] = f"error: {e}"
-        return None
-    if res.status_code == 200:
-        try:
-            _last_status[0] = "ok"
-            return res.json()
-        except Exception:
-            _last_status[0] = "invalid JSON"
+    status, data = None, None
+    for attempt in range(MAX_ATTEMPTS):
+        with _lrclib_lock:
+            wait = MIN_GAP - (time.time() - _last_call[0])
+            if wait > 0:
+                time.sleep(wait)
+            _last_call[0] = time.time()
+        status, data = _http_get_json(url, params=params,
+                                      headers=LRCLIB_HEADERS, timeout=timeout,
+                                      attempts=1, label='lrclib')
+        if status == 200:
+            _last_status[0] = "ok" if data is not None else "invalid JSON"
+            return data
+        if status == 404:
+            _last_status[0] = "not found"  # normal: lrclib has no match
             return None
-    if res.status_code == 404:
-        _last_status[0] = "not found"     # normal: lrclib simply has no match
-    else:
-        _last_status[0] = f"HTTP {res.status_code}"
-    if res.status_code == 429:
-        _cooldown_until[0] = time.time() + COOLDOWN
-        print(f"[WARN] lrclib rate-limited us (429); "
-              f"pausing lrclib for {COOLDOWN:.0f}s")
+        if status == 429:
+            _last_status[0] = "HTTP 429"
+            _cooldown_until[0] = time.time() + COOLDOWN
+            print(f"[WARN] lrclib rate-limited us (429); "
+                  f"pausing lrclib for {COOLDOWN:.0f}s")
+            return None
+        if status is not None and status not in TRANSIENT_STATUSES:
+            _last_status[0] = f"HTTP {status}"   # e.g. 400/403: don't retry
+            return None
+        # transient (5xx or no response at all): wait, then try again
+        _last_status[0] = f"HTTP {status}" if status else "error: no response"
+        if attempt < MAX_ATTEMPTS - 1:
+            time.sleep(_retry_delay(attempt))
+    # every attempt failed transiently: brief outage pause so the next
+    # searches fail fast (and use the backup source) instead of hammering
+    _cooldown_until[0] = time.time() + OUTAGE_PAUSE
+    print(f"[WARN] lrclib unreachable ({_last_status[0]}); "
+          f"pausing lrclib for {OUTAGE_PAUSE:.0f}s")
     return None
 
 
 try:
     main.lrclib_get = _throttled_lrclib_get
     print("[INFO] search_fix: lrclib rate limiter installed")
+    print("[INFO] search_fix: 5xx/network retry installed "
+          f"(attempts={MAX_ATTEMPTS}, outage pause={OUTAGE_PAUSE:.0f}s)")
 except Exception as e:
     print(f"[ERROR] search_fix: could not install lrclib limiter: {e}")
 
@@ -463,10 +543,22 @@ def _guarded(fn, message, arg):
         print(f"[ERROR] search_fix: {fn.__name__} crashed: {e}")
         import traceback
         traceback.print_exc()
+        # show the user WHAT failed (type + last frames) so a screenshot of
+        # the reply is enough to diagnose it - no log access needed
+        try:
+            frames = [ln.strip() for ln in
+                      traceback.format_exc().strip().splitlines()
+                      if ln.strip().startswith('File ')]
+            detail = f"{type(e).__name__}: {e}"[:200]
+            if frames:
+                detail += "\n" + "\n".join(frames[-3:])
+        except Exception:
+            detail = f"{type(e).__name__}: {e}"[:200]
         try:
             report(message, holder.get('status'),
                    "\u26a0\ufe0f Something went wrong handling that search.\n"
-                   "Please try again, or send /diag and show me the reply.")
+                   "Please try again, or send /diag and show me the reply.\n\n"
+                   f"Error: {detail}")
         except Exception as e2:
             print(f"[ERROR] search_fix: could not even report the crash: {e2}")
 
@@ -580,11 +672,14 @@ def fetch_lyrics_backup(artist, title):
         from urllib.parse import quote
         url = ("https://api.lyrics.ovh/v1/"
                f"{quote((artist or '').strip())}/{quote(title.strip())}")
-        res = requests.get(url, timeout=8,
-                           headers={'User-Agent': 'LyricsFinderBot/1.5',
-                                    'Accept': 'application/json'})
-        if res.status_code == 200:
-            text = ((res.json() or {}).get('lyrics') or '').strip()
+        # retries transient 5xx/network errors - a backup that dies on the
+        # first 503 is no backup at all
+        status, data = _http_get_json(
+            url, headers={'User-Agent': 'LyricsFinderBot/1.5',
+                          'Accept': 'application/json'},
+            timeout=8, attempts=3, label='lyrics.ovh')
+        if status == 200 and isinstance(data, dict):
+            text = ((data or {}).get('lyrics') or '').strip()
             if text:
                 print(f"[DEBUG] backup lyrics source worked for {artist} - {title}")
                 return text
@@ -619,16 +714,15 @@ def genius_search(fragment, limit=5):
     if not GENIUS_TOKEN:
         return None
     try:
-        import requests
-        res = requests.get(
+        status, data = _http_get_json(
             "https://api.genius.com/search", params={'q': fragment[:120]},
             headers={'Authorization': f'Bearer {GENIUS_TOKEN}',
                      'User-Agent': 'LyricsFinderBot/1.5'},
-            timeout=8)
-        if res.status_code != 200:
-            print(f"[DEBUG] Genius -> HTTP {res.status_code}")
+            timeout=8, attempts=3, label='genius')
+        if status != 200 or not isinstance(data, dict):
+            print(f"[DEBUG] Genius -> HTTP {status}")
             return None
-        hits = ((res.json() or {}).get('response') or {}).get('hits') or []
+        hits = ((data or {}).get('response') or {}).get('hits') or []
         pairs = []
         for hit in hits[:limit]:
             result = hit.get('result') or {}
