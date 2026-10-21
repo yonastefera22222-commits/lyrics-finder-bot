@@ -37,6 +37,7 @@ STILL NEEDED (Telegram setting, not code):
 import io
 import os
 import re
+import threading
 import time
 
 import main
@@ -49,6 +50,76 @@ GROUP_PLAIN_TEXT = os.environ.get('GROUP_PLAIN_TEXT', '0') == '1'
 SONG_PREFIXES = ('!song', '!lyrics', '!s', '!l', '!music')
 FIND_PREFIXES = ('!find', '!f', '!words')
 MENU = set(getattr(main, 'MENU_BUTTONS', ()) or ())
+
+
+# ------------------------------------------------- lrclib rate limiting
+# lrclib answers HTTP 429 when a client fires several requests within a couple
+# of seconds. main.py's lrclib_get() retries 3 times on anything that is not
+# 200/400/404, so one search turns into six requests and the throttling just
+# gets worse. This replacement sends at most one request every MIN_GAP seconds
+# and, on a 429, stops talking to lrclib for COOLDOWN seconds instead of
+# retrying.
+LRCLIB_HEADERS = getattr(main, 'LRCLIB_HEADERS', {
+    'User-Agent': 'LyricsFinderBot/1.1 (+https://lrclib.net)',
+    'Accept': 'application/json',
+})
+MIN_GAP = float(os.environ.get('LRCLIB_MIN_GAP', '1.2'))
+COOLDOWN = float(os.environ.get('LRCLIB_COOLDOWN', '20'))
+
+_lrclib_lock = threading.Lock()
+_last_call = [0.0]
+_last_status = [None]        # 'ok', 'HTTP 429', 'error: ...', None = nothing yet
+_cooldown_until = [0.0]
+
+
+def last_lrclib_status():
+    """What lrclib last told us. Recorded for free - no extra request."""
+    if time.time() < _cooldown_until[0]:
+        return _last_status[0] or 'HTTP 429'
+    return _last_status[0]
+
+
+def _throttled_lrclib_get(url, params=None, timeout=10):
+    """Rate-limited replacement for main.lrclib_get."""
+    if time.time() < _cooldown_until[0]:
+        return None                       # still cooling off - do not even ask
+    with _lrclib_lock:
+        wait = MIN_GAP - (time.time() - _last_call[0])
+        if wait > 0:
+            time.sleep(wait)
+        _last_call[0] = time.time()
+    try:
+        import requests
+        res = requests.get(url, params=params, headers=LRCLIB_HEADERS,
+                           timeout=timeout)
+    except Exception as e:
+        _last_status[0] = f"error: {e}"
+        return None
+    if res.status_code == 200:
+        try:
+            _last_status[0] = "ok"
+            return res.json()
+        except Exception:
+            _last_status[0] = "invalid JSON"
+            return None
+    if res.status_code == 404:
+        _last_status[0] = "not found"     # normal: lrclib simply has no match
+    else:
+        _last_status[0] = f"HTTP {res.status_code}"
+    if res.status_code == 429:
+        _cooldown_until[0] = time.time() + COOLDOWN
+        print(f"[WARN] lrclib rate-limited us (429); "
+              f"pausing lrclib for {COOLDOWN:.0f}s")
+    return None
+
+
+# main.search_tracks() looks lrclib_get up in main's globals every call, so
+# rebinding it here is enough - main.py itself needs no change.
+try:
+    main.lrclib_get = _throttled_lrclib_get
+    print("[INFO] search_fix: lrclib rate limiter installed")
+except Exception as e:
+    print(f"[ERROR] search_fix: could not install lrclib limiter: {e}")
 
 
 # ----------------------------------------------------------------- access
@@ -134,18 +205,6 @@ def report(message, status, body, markup=None):
 
 
 # ---------------------------------------------------------------- searching
-def probe_lrclib():
-    """Ask the lyrics service once, so a failed search can say why."""
-    try:
-        import requests
-        res = requests.get(
-            "https://lrclib.net/api/search", params={'q': 'adele hello'},
-            timeout=8,
-            headers={'User-Agent': 'LyricsFinderBot/1.1 (+https://lrclib.net)',
-                     'Accept': 'application/json'})
-        return "ok" if res.status_code == 200 else f"HTTP {res.status_code}"
-    except Exception as e:
-        return f"error: {e}"
 
 
 def _guarded(fn, message, arg):
@@ -223,12 +282,17 @@ def _do_search(message, query, holder):
                    markup=markup)
             return
 
-        why = probe_lrclib()
-        if why == "ok":
+        why = last_lrclib_status()
+        if why in (None, "ok", "not found"):
             report(message, status,
                    "\U0001f937 No lyrics found for that.\n\n"
                    "Try: Artist - Song   (e.g. Adele - Hello)\n"
                    "Or send me the audio file and tap \u2728 Lyricize.")
+        elif why and "429" in str(why):
+            report(message, status,
+                   "\u23f3 The lyrics service is rate-limiting us right now.\n\n"
+                   "Please wait about 30 seconds and search again.\n"
+                   "It happens when several searches are made within a few seconds.")
         else:
             report(message, status,
                    f"\u26a0\ufe0f The lyrics service isn't answering right now ({why}).\n\n"
